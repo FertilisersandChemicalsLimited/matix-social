@@ -27,6 +27,15 @@ function genPostId() {
   });
 }
 
+// Flatten user prompt text into a single paragraph before sending to webhooks:
+// strips line breaks + tabs and collapses any run of whitespace into a single space.
+// Returns null when the result is empty so n8n receives a real null, not "".
+function normalizePrompt(s) {
+  if (!s) return null;
+  const flat = String(s).replace(/\s+/g, ' ').trim();
+  return flat || null;
+}
+
 export default function PostCreator({ data, onNavigate, onClose, initialRecordId, composePlatforms = [] }) {
   const { campaigns, loading, refresh } = data;
 
@@ -313,10 +322,10 @@ export default function PostCreator({ data, onNavigate, onClose, initialRecordId
         event_date: form.date,
         post_type: form.postType,
         caption_style: form.captionStyle,
-        user_image_prompt: form.imagePrompt.trim() || null,
+        user_image_prompt: normalizePrompt(form.imagePrompt),
         platforms_selected: platforms,
         source_image_urls: sourceUrls,
-        caption_prompts: form.captionPrompt.trim() || null
+        caption_prompts: normalizePrompt(form.captionPrompt)
       });
 
       // 4. Hand off to the polling effects above — they refresh every 3s and exit when the
@@ -338,7 +347,7 @@ export default function PostCreator({ data, onNavigate, onClose, initialRecordId
     if (!campaign) return;
     setBusy('image');
     try {
-      await regenerateImage(campaign.post_id, form.imagePrompt.trim() || null);
+      await regenerateImage(campaign.post_id, normalizePrompt(form.imagePrompt));
       toast.success('Regenerating image…');
       await refresh();
     } catch (e) { toast.error(e.message); }
@@ -349,7 +358,7 @@ export default function PostCreator({ data, onNavigate, onClose, initialRecordId
     if (!campaign) return;
     setBusy('variants');
     try {
-      await regenerateVariants(campaign.post_id, form.imagePrompt.trim() || null);
+      await regenerateVariants(campaign.post_id, normalizePrompt(form.imagePrompt));
       toast.success('Regenerating variants…');
       await refresh();
     } catch (e) { toast.error(e.message); }
@@ -361,7 +370,7 @@ export default function PostCreator({ data, onNavigate, onClose, initialRecordId
     setBusy(`caption-${platform}`);
     setApprovalDirty(prev => ({ ...prev, [platform]: true }));
     try {
-      await regenerateCaption(campaign.post_id, platform, form.captionPrompt.trim() || null);
+      await regenerateCaption(campaign.post_id, platform, normalizePrompt(form.captionPrompt));
       toast.success(`Regenerating ${PLATFORM_META[platform]?.label} caption…`);
       await refresh();
     } catch (e) { toast.error(e.message); }
