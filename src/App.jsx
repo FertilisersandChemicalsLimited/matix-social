@@ -99,7 +99,13 @@ function Shell({ session, onLogout }) {
               <path d="M4 6h16M4 12h16M4 18h16" strokeLinecap="round"/>
             </svg>
           </button>
-          <div className="ml-2 h-display text-lg text-brand-700 font-bold">Matix</div>
+          <button
+            onClick={() => handleNavigate('dashboard')}
+            className="ml-2 h-display text-lg text-brand-700 font-bold hover:text-brand-800 transition-colors"
+            aria-label="Go to dashboard"
+          >
+            Matix
+          </button>
         </div>
         <button
           onClick={handleOpenPicker}

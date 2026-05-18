@@ -142,11 +142,14 @@ export default function Schedule({ data, onNavigate, onNewPost }) {
 
         {/* Status + Platform filter row */}
         <div className="mt-8 flex flex-wrap items-center gap-3 animate-fade-up">
-          <div className="inline-flex p-1 bg-cream-100 rounded-full border border-cream-300/60">
-            <FilterChip label="All Posts" count={counts.All} active={activeFilter === 'All'} onClick={() => setActiveFilter('All')} />
-            <FilterChip label="Scheduled" count={counts.Scheduled} active={activeFilter === 'Scheduled'} onClick={() => setActiveFilter('Scheduled')} />
-            <FilterChip label="Drafts"    count={counts.Drafts}    active={activeFilter === 'Drafts'}    onClick={() => setActiveFilter('Drafts')} />
-            <FilterChip label="Posted"    count={counts.Posted}    active={activeFilter === 'Posted'}    onClick={() => setActiveFilter('Posted')} />
+          {/* Status chip group — horizontal scroll on mobile so all four chips stay reachable */}
+          <div className="w-full sm:w-auto overflow-x-auto scrollbar-none -mx-1 sm:mx-0">
+            <div className="inline-flex p-1 bg-cream-100 rounded-full border border-cream-300/60 mx-1 sm:mx-0">
+              <FilterChip label="All Posts" shortLabel="All"  count={counts.All}       active={activeFilter === 'All'}       onClick={() => setActiveFilter('All')} />
+              <FilterChip label="Scheduled"                    count={counts.Scheduled} active={activeFilter === 'Scheduled'} onClick={() => setActiveFilter('Scheduled')} />
+              <FilterChip label="Drafts"                       count={counts.Drafts}    active={activeFilter === 'Drafts'}    onClick={() => setActiveFilter('Drafts')} />
+              <FilterChip label="Posted"                       count={counts.Posted}    active={activeFilter === 'Posted'}    onClick={() => setActiveFilter('Posted')} />
+            </div>
           </div>
 
           <div className="flex items-center gap-2 text-xs text-ink-500">
@@ -246,18 +249,26 @@ export default function Schedule({ data, onNavigate, onNewPost }) {
   );
 }
 
-function FilterChip({ label, count, active, onClick }) {
+function FilterChip({ label, shortLabel, count, active, onClick }) {
   return (
     <button
       onClick={onClick}
       className={[
-        'px-4 py-1.5 rounded-full text-sm font-semibold inline-flex items-center gap-2 transition-all',
+        'px-3 sm:px-4 py-1.5 rounded-full text-xs sm:text-sm font-semibold inline-flex items-center gap-1.5 sm:gap-2 transition-all whitespace-nowrap shrink-0',
         active
           ? 'bg-brand-gradient text-white shadow-soft'
           : 'text-ink-700 hover:text-ink-900'
       ].join(' ')}
     >
-      {label}
+      {/* Use a shorter label on mobile when one is provided */}
+      {shortLabel ? (
+        <>
+          <span className="sm:hidden">{shortLabel}</span>
+          <span className="hidden sm:inline">{label}</span>
+        </>
+      ) : (
+        label
+      )}
       <span className={`text-[10px] font-bold rounded-full px-1.5 py-0.5 ${active ? 'bg-white/25 text-white' : 'bg-cream-200 text-ink-700'}`}>
         {count}
       </span>
