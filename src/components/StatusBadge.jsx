@@ -23,19 +23,27 @@ const DOT = {
 const PULSING = new Set(['yellow', 'blue']);
 
 const MAP = {
-  Approved: 'green', Pending: 'yellow', Rejected: 'red',
-  Posted: 'green',
+  // approval
+  Draft: 'yellow', Approved: 'green', Rejected: 'red',
+  // published
+  Scheduled: 'blue', Posted: 'green', Failed: 'red',
+  // legacy
+  Pending: 'yellow',
+  // post type
   Observance: 'purple', Event: 'brand', Collage: 'blue',
+  observance: 'purple', event: 'brand', collage: 'blue',
+  // caption style
   Engaging: 'brand', Professional: 'blue', 'Data-Driven': 'purple', Conversational: 'green'
 };
 
 export default function StatusBadge({ value, tone, className = '' }) {
   if (!value) return null;
   const t = tone || MAP[value] || 'gray';
+  const display = typeof value === 'string' ? value.charAt(0).toUpperCase() + value.slice(1) : value;
   return (
     <span className={`inline-flex items-center gap-1.5 rounded-full px-2.5 py-1 text-xs font-medium ring-1 ring-inset transition-transform hover:scale-105 ${TONE[t]} ${className}`}>
       <span className={`h-1.5 w-1.5 rounded-full ${DOT[t]} ${PULSING.has(t) ? 'animate-pulse-soft' : ''}`} />
-      {value}
+      {display}
     </span>
   );
 }

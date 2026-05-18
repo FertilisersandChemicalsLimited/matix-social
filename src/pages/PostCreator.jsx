@@ -1,556 +1,799 @@
-import React, { useEffect, useMemo, useRef, useState } from 'react';
-import { createPortal } from 'react-dom';
+import React, { useEffect, useMemo, useState } from 'react';
 import { Spinner } from '../components/Loader.jsx';
+import { PreviewSwitcher } from '../components/PlatformPreviews.jsx';
+import ImageWorkbench from '../components/ImageWorkbench.jsx';
 import { useToast } from '../components/Toast.jsx';
-import { FIELDS, POST_TYPES, CAPTION_STYLES } from '../utils/config.js';
-import { triggerGenerate, triggerPostNow, triggerSchedule } from '../services/webhook.js';
+import {
+  POST_TYPES, POST_TYPE_LABELS, CAPTION_STYLES,
+  PLATFORM_LIST, PLATFORM_META
+} from '../utils/config.js';
+// uploadToImageKit is dynamic-imported inside ImageLinksUploader to keep this file lean
+import { waitForCampaign } from '../services/supabase.js';
+import {
+  createCampaign, regenerateImage, regenerateVariants,
+  regenerateCaption, saveCaptionEdit,
+  approvePlatform, rejectPlatform,
+  postNow, schedulePlatform
+} from '../services/webhook.js';
 
-function newRow(type = 'link') {
-  const id = (typeof crypto !== 'undefined' && crypto.randomUUID)
-    ? crypto.randomUUID()
-    : Math.random().toString(36).slice(2);
-  return { id, type, value: '' };
+function genPostId() {
+  if (typeof crypto !== 'undefined' && crypto.randomUUID) return crypto.randomUUID();
+  // Fallback (RFC4122 v4)
+  return 'xxxxxxxx-xxxx-4xxx-yxxx-xxxxxxxxxxxx'.replace(/[xy]/g, c => {
+    const r = Math.random() * 16 | 0;
+    const v = c === 'x' ? r : (r & 0x3 | 0x8);
+    return v.toString(16);
+  });
 }
 
-function validValues(items) {
-  return items.filter(it => it.value && it.value.trim()).map(it => it.value.trim());
-}
+export default function PostCreator({ data, onNavigate, onClose, initialRecordId, composePlatforms = [] }) {
+  const { campaigns, loading, refresh } = data;
 
-const POLL_INTERVAL_MS = 3000;
-const POLL_TIMEOUT_MS = 90000;
-const UPLOAD_URL = "https://script.google.com/macros/s/AKfycbxnHP4qF6dtrpZpXgY82aI4BxURLuzzrFrmZHXx8_4pd8O0TbuyrtOWnUJzA5G9XpeeGg/exec";
+  const campaign = useMemo(
+    () => campaigns.find(c => c.post_id === initialRecordId) || null,
+    [campaigns, initialRecordId]
+  );
 
-export default function PostCreator({ data, onNavigate, initialRecordId }) {
-  const toast = useToast();
-  const { records, create, patch, refresh } = data;
+  const isEditing = !!campaign;
+  const readOnly = isEditing; // Form fields read-only for existing campaigns (Phase 5 will wire edits)
+  // Draft actions (regenerate / edit caption) are allowed unless this platform has already been posted
 
-  const [recordId, setRecordId] = useState(null);
-  const [generating, setGenerating] = useState(false);
-  const [busy, setBusy] = useState(null);          // 'post' | 'schedule' 
-  const [schedDate, setSchedDate] = useState(new Date().toISOString().slice(0, 10));
-  const [schedHour, setSchedHour] = useState('10');
-  const [schedAmpm, setSchedAmpm] = useState('AM');
-  const [timer, setTimer] = useState(0);
-  const [showPreviewBtn, setShowPreviewBtn] = useState(false);
-  const [showModal, setShowModal] = useState(false);
+  const platforms = useMemo(() => {
+    if (isEditing) return campaign.platforms_selected || [];
+    return composePlatforms || [];
+  }, [isEditing, campaign, composePlatforms]);
+
+  const [activePlatform, setActivePlatform] = useState(platforms[0] || 'instagram');
+  useEffect(() => {
+    if (platforms.length && !platforms.includes(activePlatform)) {
+      setActivePlatform(platforms[0]);
+    }
+  }, [platforms, activePlatform]);
+
+  const [variantIdx, setVariantIdx] = useState(campaign?.selected_variant_index ?? 0);
+  useEffect(() => {
+    setVariantIdx(campaign?.selected_variant_index ?? 0);
+  }, [campaign?.post_id, campaign?.selected_variant_index]);
+
+  const handleSelectVariant = async (i) => {
+    setVariantIdx(i); // optimistic
+    // Smooth-scroll to top so the user sees the freshly-selected variant in the right-rail
+    // preview and the platform caption cards without having to scroll back up.
+    window.scrollTo({ top: 0, behavior: 'smooth' });
+    if (!campaign) return;
+    try {
+      const { selectVariant } = await import('../services/webhook.js');
+      await selectVariant(campaign.post_id, i);
+    } catch (e) {
+      console.error('selectVariant', e);
+    }
+  };
 
   const [form, setForm] = useState({
     eventName: '',
     date: new Date().toISOString().slice(0, 10),
-    postType: 'Observance',
+    postType: 'observance',
     captionStyle: 'Engaging',
     imagePrompt: '',
-    imageItems: [newRow()]
+    sourceImages: [], // [{ id, url, name }]
+    captionPrompt: '',    // single shared brief — applied to ALL platforms
+    captionOverrides: {}  // per-platform manual edits: { instagram, x, linkedin, fb }
   });
-
+  const [editingPlatform, setEditingPlatform] = useState(null); // which platform is in edit mode
+  const [draftEdit, setDraftEdit] = useState(''); // textarea buffer while editing
+  // Per-platform flag — true once Regenerate or Save edit invalidates a previously-approved caption.
+  // Clears on Accept (and when a fresh campaign loads). Keeps the Accept button visible even when
+  // the server still says approval === 'approved' but the caption has been changed since.
+  const [approvalDirty, setApprovalDirty] = useState({});
 
   useEffect(() => {
-    if (initialRecordId) {
-      const rec = records.find(r => r.id === initialRecordId);
-      if (rec) {
-        const f = rec.fields;
-        setRecordId(rec.id);
-        const links = f[FIELDS.imageLinks] || '';
-        setForm({
-          eventName: f[FIELDS.eventName] || '',
-          date: f[FIELDS.date] || new Date().toISOString().slice(0, 10),
-          postType: f[FIELDS.postType] || 'Observance',
-          captionStyle: f[FIELDS.captionStyle] || 'Engaging',
-          imagePrompt: f[FIELDS.imagePrompt] || '',
-          imageItems: links
-            ? links.split(', ').map(url => ({ id: Math.random().toString(36).slice(2), type: 'link', value: url }))
-            : [newRow()]
-        });
-        setShowPreviewBtn(true);
-      }
+    if (campaign) {
+      setForm({
+        eventName: campaign.event_name || '',
+        date: campaign.event_date || new Date().toISOString().slice(0, 10),
+        postType: campaign.post_type || 'observance',
+        captionStyle: campaign.caption_style || 'Engaging',
+        imagePrompt: campaign.user_image_prompt || '',
+        sourceImages: (campaign.source_image_urls || []).map((url, i) => ({ id: `s${i}`, url, name: '', status: 'ready' })),
+        captionPrompt: campaign.caption_prompts || '',
+        captionOverrides: {}
+      });
     } else {
-      setRecordId(null);
       setForm({
         eventName: '',
         date: new Date().toISOString().slice(0, 10),
-        postType: 'Observance',
+        postType: 'observance',
         captionStyle: 'Engaging',
         imagePrompt: '',
-        imageItems: [newRow()]
+        sourceImages: [],
+        captionPrompt: '',
+        captionOverrides: {}
       });
-      setShowPreviewBtn(false);
     }
-  }, [initialRecordId]);
+    setEditingPlatform(null);
+    setApprovalDirty({});
+  }, [campaign]);
 
-  const bound = useMemo(
-    () => records.find(r => r.id === recordId) || null,
-    [records, recordId]
-  );
-
-  const status = bound?.fields[FIELDS.approvalStatus];
-  const isLocked = bound?.fields[FIELDS.published] === 'Posted';
-  const isRegenerate = status === 'Regenerate';
-  const generatedImage = bound?.fields[FIELDS.generatedImage];
-  const remoteCaption = bound?.fields[FIELDS.captionDraft];
-
-  const linkUrls = validValues(form.imageItems);
-  const linkCount = linkUrls.length;
-  const imageLinksString = linkUrls.join(', ');
-
-  const linksValid = linkCount >= 1 && linkCount <= 5;
-
-  const previewImages = (form.postType === 'Observance' || form.postType === 'Collage')
-    ? [generatedImage].filter(Boolean)
-    : linkUrls;
-
-  const previewImage = previewImages[0] || null;
-
-  /* poll Airtable while workflow runs */
-  const baseline = useRef({ image: null, caption: null });
-  const startedAt = useRef(0);
+  // Clean up blob URLs created by file uploads when component unmounts
   useEffect(() => {
-    if (!generating || !recordId) return;
-    startedAt.current = Date.now();
-    const t = setInterval(() => {
-      if (Date.now() - startedAt.current > POLL_TIMEOUT_MS) {
-        setGenerating(false);
-        toast.error('Workflow timed out — check Airtable');
-        return;
-      }
-      console.log('[Polling] Refreshing record:', recordId);
-      refresh();
-    }, POLL_INTERVAL_MS);
-    return () => clearInterval(t);
-  }, [generating, recordId, refresh, toast]);
+    return () => {
+      form.sourceImages.forEach(s => {
+        if (s.url && s.url.startsWith('blob:')) URL.revokeObjectURL(s.url);
+      });
+    };
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, []);
 
-  /* detect completion */
+  const set = (k) => (e) => setForm(f => ({ ...f, [k]: e.target?.value ?? e }));
+
+  const caption = campaign ? campaign[`${activePlatform}_caption`] : null;
+  const captionStatus = campaign ? campaign[`${activePlatform}_caption_status`] : 'idle';
+  const approval  = campaign ? campaign[`${activePlatform}_approval_status`] : 'draft';
+  const published = campaign ? campaign[`${activePlatform}_published_status`] : 'draft';
+  const scheduledAt = campaign ? campaign[`${activePlatform}_scheduled_at`] : null;
+  const postedAt    = campaign ? campaign[`${activePlatform}_posted_at`] : null;
+
+  const images = useMemo(() => {
+    // Live preview for new posts being composed
+    if (!campaign) {
+      if (form.postType === 'event') return form.sourceImages.map(s => s.url);
+      return [];
+    }
+    if (campaign.post_type === 'event') return campaign.source_image_urls || [];
+    const variants = campaign.generated_image_variants || [];
+    return variants.length ? [variants[variantIdx] || variants[0]] : [];
+  }, [campaign, variantIdx, form.postType, form.sourceImages]);
+
+  const activeMeta = PLATFORM_META[activePlatform];
+
+  /* ---------- Action wiring (Phase 5) ---------- */
+  const toast = useToast();
+  const [busy, setBusy] = useState(null); // 'forge' | 'image' | 'variants' | `caption-${platform}` | `approve-${platform}` | `reject-${platform}` | `post-${platform}` | `schedule-${platform}` | `save-${platform}`
+  const [generating, setGenerating] = useState(false); // true while waiting for n8n to finish writing image + captions
+  const [pendingPostId, setPendingPostId] = useState(null); // freshly-created post_id awaiting first read
+  const [genStartedAt, setGenStartedAt] = useState(null); // ms timestamp when Forge was clicked
+  const [nowMs, setNowMs] = useState(Date.now());        // ticked every 500ms while generating so timer UI updates
+  const [previewModalOpen, setPreviewModalOpen] = useState(false); // full-size preview modal
+  // Tracks an in-flight Post Now / Schedule action waiting for Supabase to reflect the new status.
+  // Shape: { platform: 'x', action: 'post'|'schedule', startedAt: ms } | null
+  const [publishingState, setPublishingState] = useState(null);
+  const [publishingNowMs, setPublishingNowMs] = useState(Date.now());
+
+  const ESTIMATED_GEN_SECONDS = 60;
+  const GEN_SAFETY_TIMEOUT_MS = 5 * 60 * 1000; // hard stop after 5 min
+
+  const [schedDate, setSchedDate] = useState(new Date().toISOString().slice(0, 10));
+  const [schedHour, setSchedHour] = useState('10');
+  const [schedAmpm, setSchedAmpm] = useState('AM');
+
+  // Tick the local clock every 500ms while generating so the elapsed/remaining counter updates
   useEffect(() => {
-    if (!generating || !bound) return;
-    const f = bound.fields;
-    const img = f[FIELDS.generatedImage] || null;
-    const cap = f[FIELDS.captionDraft] || null;
-    const wantImage = form.postType === 'Observance';
+    if (!generating) return;
+    setNowMs(Date.now());
+    const i = setInterval(() => setNowMs(Date.now()), 500);
+    return () => clearInterval(i);
+  }, [generating]);
 
-    const gotImage = wantImage ? img && img !== baseline.current.image : true;
-    const gotCaption = cap && cap !== baseline.current.caption;
+  // Poll Supabase every 3s while generating — picks up n8n's writes to image variants & captions
+  useEffect(() => {
+    if (!generating) return;
+    const i = setInterval(() => { refresh(); }, 3000);
+    return () => clearInterval(i);
+  }, [generating, refresh]);
 
-    console.log('[Detection] Current Record State:', {
-      id: bound.id,
-      postType: form.postType,
-      hasImage: !!img,
-      hasCaption: !!cap,
-      gotImage,
-      gotCaption,
-      fields: Object.keys(f)
-    });
-
-    if (gotImage && gotCaption) {
-      console.log('[Detection] SUCCESS: All content found.');
+  // Hard timeout — if we're still generating after the safety cap, give up
+  useEffect(() => {
+    if (!generating || !genStartedAt) return;
+    const t = setTimeout(() => {
       setGenerating(false);
-      setShowPreviewBtn(true);
-      toast.success('Content ready!');
-    }
-  }, [bound?.fields[FIELDS.generatedImage], bound?.fields[FIELDS.captionDraft], generating, form.postType, toast]);
+      setPendingPostId(null);
+      toast.error('Generation timed out — refresh to check status');
+    }, GEN_SAFETY_TIMEOUT_MS);
+    return () => clearTimeout(t);
+  }, [generating, genStartedAt]); // eslint-disable-line react-hooks/exhaustive-deps
 
-  const set = (k) => (e) => setForm({ ...form, [k]: e.target?.value ?? e });
-
-  const setImageItems = (items) => setForm({ ...form, imageItems: items });
-  
-  const openPreview = async () => {
-    if (!recordId) return;
-    try {
-      await refresh();
-    } catch (e) {
-      console.error('Refresh error:', e);
-    }
-    setShowModal(true);
+  // Has the campaign finished generating? Need image (variants for observance/collage, sources for
+  // event) AND a caption for every selected platform.
+  const isReady = (c) => {
+    if (!c) return false;
+    const imageReady = c.post_type === 'event'
+      ? Array.isArray(c.source_image_urls) && c.source_image_urls.length > 0
+      : Array.isArray(c.generated_image_variants) && c.generated_image_variants.length > 0;
+    const ps = Array.isArray(c.platforms_selected) ? c.platforms_selected : [];
+    const captionsReady = ps.length > 0 && ps.every(p => !!c[`${p}_caption`]);
+    return imageReady && captionsReady;
   };
 
-
-  const canGenerate = !!form.eventName.trim() && !generating && (form.postType === 'Observance' || linksValid);
-
-  async function doGenerate() {
-    console.log('[PostCreator] Starting generation for:', form.eventName);
-    if (!form.eventName.trim()) { toast.error('Add an Occasion / Event Name first'); return; }
-    if (form.postType === 'Event' && linkCount < 1) { toast.error('Add at least 1 image link'); return; }
-    if (form.postType === 'Collage' && (linkCount < 1 || linkCount > 5)) { toast.error('Collage needs 1–5 image links'); return; }
-
-    setGenerating(true);
-    try {
-      const fields = {};
-
-      if (form.eventName.trim()) fields[FIELDS.eventName] = form.eventName.trim();
-      // if (form.date) fields[FIELDS.date] = form.date;
-      if (form.postType) fields[FIELDS.postType] = form.postType;
-
-      if (form.postType !== 'Observance') {
-        if (form.captionStyle) fields[FIELDS.captionStyle] = form.captionStyle;
-        if (imageLinksString) fields[FIELDS.imageLinks] = imageLinksString;
+  // Reconciliation effect — runs whenever campaigns refresh while we're generating.
+  // 1. If the pending row hasn't appeared yet, do nothing (keep polling).
+  // 2. Once it appears, switch the URL/state to that post so the user sees live updates.
+  // 3. Once the campaign is fully populated (image + captions), exit generating mode.
+  useEffect(() => {
+    if (!generating) return;
+    if (pendingPostId) {
+      const row = campaigns.find(c => c.post_id === pendingPostId);
+      if (!row) return;
+      if (initialRecordId !== pendingPostId) {
+        onNavigate?.('post-creator', pendingPostId);
+        // Don't clear pendingPostId yet — wait for full readiness on next tick
+        return;
       }
-
-      if (form.imagePrompt.trim()) fields[FIELDS.imagePrompt] = form.imagePrompt.trim();
-
-      let targetRecordId = recordId;
-
-      if (targetRecordId) {
-        // UPDATE EXISTING - Set to Regenerate
-        fields[FIELDS.approvalStatus] = 'Regenerate';
-        console.log('Patching Airtable record:', targetRecordId, fields);
-        await patch(targetRecordId, fields);
-        toast.info('Record updated — re-running workflow…');
-      } else {
-        // CREATE NEW
-        fields[FIELDS.approvalStatus] = 'Generate Post';
-        fields[FIELDS.published] = 'Pending';
-        console.log('Creating new Airtable record:', fields);
-        const created = await create(fields);
-        targetRecordId = created.id;
-        setRecordId(targetRecordId);
-        toast.info('Record created — waiting for background process…');
+      // We're viewing the row now — check if it's fully baked
+      if (isReady(row)) {
+        setGenerating(false);
+        setPendingPostId(null);
+        setGenStartedAt(null);
+        toast.success('Content ready!');
       }
-
-      // Refresh baseline for detection
-      const updatedRec = records.find(r => r.id === targetRecordId) || null;
-      if (updatedRec) {
-        baseline.current = {
-          image: updatedRec.fields[FIELDS.generatedImage] || null,
-          caption: updatedRec.fields[FIELDS.captionDraft] || null
-        };
-      }
-
-      // Start 30s timer
-      setTimer(30);
-      setShowPreviewBtn(false);
-      const interval = setInterval(() => {
-        setTimer(prev => {
-          if (prev <= 1) {
-            clearInterval(interval);
-            setShowPreviewBtn(true);
-            setGenerating(false);
-            return 0;
-          }
-          return prev - 1;
-        });
-      }, 1000);
-
-    } catch (e) {
+    } else if (campaign && isReady(campaign)) {
+      // Edge case: generating became true on an existing campaign (e.g. image regen) and it's now ready
       setGenerating(false);
-      toast.error(e.message);
+      setGenStartedAt(null);
     }
-  }
+  }, [campaigns, pendingPostId, generating, campaign, initialRecordId, onNavigate]);
 
-  async function saveDraft() {
-    if (!recordId) { toast.info('Run Generate Content first to save the draft'); return; }
-    setBusy('save');
+  /* ------- Publishing overlay (Post Now / Schedule) ------- */
+
+  // Tick the clock so the elapsed counter on the publishing overlay updates
+  useEffect(() => {
+    if (!publishingState) return;
+    setPublishingNowMs(Date.now());
+    const i = setInterval(() => setPublishingNowMs(Date.now()), 500);
+    return () => clearInterval(i);
+  }, [publishingState]);
+
+  // Poll Supabase every 3s while waiting for the platform status to flip
+  useEffect(() => {
+    if (!publishingState) return;
+    const i = setInterval(() => { refresh(); }, 3000);
+    return () => clearInterval(i);
+  }, [publishingState, refresh]);
+
+  // Safety cap — give up after 3 minutes so the overlay can't get stuck forever
+  useEffect(() => {
+    if (!publishingState) return;
+    const t = setTimeout(() => {
+      setPublishingState(null);
+      toast.error('Still waiting on the platform — refresh to check status');
+    }, 3 * 60 * 1000);
+    return () => clearTimeout(t);
+  }, [publishingState]); // eslint-disable-line react-hooks/exhaustive-deps
+
+  // Watch for the target status to land in Supabase, then close the overlay
+  useEffect(() => {
+    if (!publishingState || !campaign) return;
+    const current = campaign[`${publishingState.platform}_published_status`];
+    const target = publishingState.action === 'post' ? 'posted' : 'scheduled';
+    if (current === target) {
+      const lbl = PLATFORM_META[publishingState.platform]?.label || publishingState.platform;
+      toast.success(publishingState.action === 'post' ? `Posted to ${lbl}!` : `Scheduled on ${lbl}`);
+      setPublishingState(null);
+    }
+  }, [campaigns, publishingState, campaign]);
+
+  /* ---------------------------------------------------------- */
+
+  const handleForge = async () => {
+    if (!form.eventName.trim()) { toast.error('Add an Occasion / Event Name first'); return; }
+    if ((form.postType === 'event' || form.postType === 'collage') && form.sourceImages.length === 0) {
+      toast.error(`${form.postType === 'event' ? 'Event' : 'Collage'} needs at least one image`);
+      return;
+    }
+    if (platforms.length === 0) { toast.error('Pick at least one platform'); return; }
+
+    // Block if any images are still uploading or failed
+    const stillUploading = form.sourceImages.filter(i => i.status === 'uploading').length;
+    const failed = form.sourceImages.filter(i => i.status === 'failed').length;
+    if (stillUploading > 0) { toast.error(`Wait — ${stillUploading} image${stillUploading === 1 ? '' : 's'} still uploading`); return; }
+    if (failed > 0) { toast.error(`${failed} image${failed === 1 ? '' : 's'} failed to upload — retry or remove`); return; }
+
+    setBusy('forge');
+    setGenerating(true);
+    setGenStartedAt(Date.now());
+    // Snap the page to the top instantly (no smooth animation) so it doesn't race with the
+    // body-scroll-lock applied by the overlay. When the overlay closes the user lands at the
+    // top of the freshly-generated post.
+    window.scrollTo(0, 0);
+
     try {
-      const fields = {};
-      if (form.eventName) fields[FIELDS.eventName] = form.eventName;
-      if (form.date) fields[FIELDS.date] = form.date;
-      if (form.postType) fields[FIELDS.postType] = form.postType;
-      if (form.captionStyle) fields[FIELDS.captionStyle] = form.captionStyle;
-      if (form.imagePrompt) fields[FIELDS.imagePrompt] = form.imagePrompt;
-      if (imageLinksString) fields[FIELDS.imageLinks] = imageLinksString;
+      // 1. Source URLs are already on ImageKit (uploaded on drop). Just collect them.
+      const sourceUrls = form.sourceImages
+        .filter(i => (i.status === 'ready' || !i.status) && i.url && !i.url.startsWith('blob:'))
+        .map(i => i.url);
 
-      await patch(recordId, fields);
-      toast.success('Draft saved');
+      // 2. Generate the post_id client-side
+      const post_id = genPostId();
+
+      // 3. Fire webhook — keys match Supabase columns
+      await createCampaign({
+        post_id,
+        event_name: form.eventName.trim(),
+        event_date: form.date,
+        post_type: form.postType,
+        caption_style: form.captionStyle,
+        user_image_prompt: form.imagePrompt.trim() || null,
+        platforms_selected: platforms,
+        source_image_urls: sourceUrls,
+        caption_prompts: form.captionPrompt.trim() || null
+      });
+
+      // 4. Hand off to the polling effects above — they refresh every 3s and exit when the
+      //    campaign row exists AND every selected platform has its caption + image written.
+      toast.success('Workflow started — generating content…');
+      setPendingPostId(post_id);
+    } catch (e) {
+      console.error(e);
+      toast.error(e.message || 'Failed to start workflow');
+      setGenerating(false);
+      setGenStartedAt(null);
+      setPendingPostId(null);
+    } finally {
+      setBusy(null);
+    }
+  };
+
+  const handleRegenerateImage = async () => {
+    if (!campaign) return;
+    setBusy('image');
+    try {
+      await regenerateImage(campaign.post_id, form.imagePrompt.trim() || null);
+      toast.success('Regenerating image…');
+      await refresh();
     } catch (e) { toast.error(e.message); }
     finally { setBusy(null); }
-  }
+  };
 
-  async function doPostNow() {
-    if (!recordId || !remoteCaption) { toast.error('Generate content first'); return; }
-    if (bound && bound.fields[FIELDS.approvalStatus] !== 'Approved') {
-      try { await patch(recordId, { [FIELDS.approvalStatus]: 'Approved' }); }
-      catch (e) { toast.error(e.message); return; }
-    }
-    setBusy('post');
+  const handleRegenerateVariants = async () => {
+    if (!campaign) return;
+    setBusy('variants');
     try {
-      // await triggerPostNow({
-      //   recordId,
-      //   post_type: form.postType,
-      //   caption: remoteCaption,
-      //   image_url: generatedImage,
-      //   image_links: linkUrls
-      // });
-      toast.success('Posted to LinkedIn. Redirecting…');
-      setTimeout(() => {
-        refresh();
-        onNavigate('schedule');
-      }, 2000);
+      await regenerateVariants(campaign.post_id, form.imagePrompt.trim() || null);
+      toast.success('Regenerating variants…');
+      await refresh();
     } catch (e) { toast.error(e.message); }
     finally { setBusy(null); }
-  }
+  };
 
-  async function doSchedule() {
-    if (!schedDate) { toast.error('Pick a date'); return; }
-    if (!recordId || !remoteCaption) { toast.error('Generate content first'); return; }
-    setBusy('schedule');
+  const handleRegenerateCaption = async (platform = activePlatform) => {
+    if (!campaign) return;
+    setBusy(`caption-${platform}`);
+    setApprovalDirty(prev => ({ ...prev, [platform]: true }));
     try {
-      let h = parseInt(schedHour);
+      await regenerateCaption(campaign.post_id, platform, form.captionPrompt.trim() || null);
+      toast.success(`Regenerating ${PLATFORM_META[platform]?.label} caption…`);
+      await refresh();
+    } catch (e) { toast.error(e.message); }
+    finally { setBusy(null); }
+  };
+
+  const handleSaveCaption = async (newText, platform = activePlatform) => {
+    if (!campaign) {
+      // No campaign yet — local-only edit
+      setForm(f => ({ ...f, captionOverrides: { ...f.captionOverrides, [platform]: newText } }));
+      return;
+    }
+    setBusy(`save-${platform}`);
+    setApprovalDirty(prev => ({ ...prev, [platform]: true }));
+    try {
+      await saveCaptionEdit(campaign.post_id, platform, newText);
+      toast.success('Caption saved');
+      await refresh();
+    } catch (e) { toast.error(e.message); }
+    finally { setBusy(null); }
+  };
+
+  const handleApprove = async (platform = activePlatform) => {
+    if (!campaign) return;
+    setBusy(`approve-${platform}`);
+    try {
+      await approvePlatform(campaign.post_id, platform);
+      setApprovalDirty(prev => ({ ...prev, [platform]: false }));
+      toast.success(`${PLATFORM_META[platform]?.label} approved`);
+      await refresh();
+    } catch (e) { toast.error(e.message); }
+    finally { setBusy(null); }
+  };
+
+  const handleReject = async (platform = activePlatform) => {
+    if (!campaign) return;
+    setBusy(`reject-${platform}`);
+    try {
+      await rejectPlatform(campaign.post_id, platform);
+      toast.success(`${PLATFORM_META[platform]?.label} rejected`);
+      await refresh();
+    } catch (e) { toast.error(e.message); }
+    finally { setBusy(null); }
+  };
+
+  const handlePostNow = async (platform = activePlatform) => {
+    if (!campaign) return;
+    setBusy(`post-${platform}`);
+    setPublishingState({ platform, action: 'post', startedAt: Date.now() });
+    window.scrollTo(0, 0);
+    try {
+      // Send the picker time as scheduled_at — same logic as handleSchedule — so both
+      // buttons emit a consistent payload shape and n8n can read one field for either action.
+      let h = parseInt(schedHour, 10) || 0;
       if (schedAmpm === 'PM' && h < 12) h += 12;
       if (schedAmpm === 'AM' && h === 12) h = 0;
-
-      const d = new Date(schedDate);
-      d.setHours(h, 0, 0, 0);
-      const iso = d.toISOString();
-
-      // await triggerSchedule({
-      //   recordId,
-      //   post_type: form.postType,
-      //   caption: remoteCaption,
-      //   image_url: generatedImage,
-      //   image_links: linkUrls
-      // }, iso);
-      await patch(recordId, {
-        [FIELDS.postDate]: iso.slice(0, 10),
-        [FIELDS.schedulingDate]: iso,
-        [FIELDS.published]: 'Scheduled'
-      });
-      toast.success('Scheduled');
-      onNavigate('schedule');
-    } catch (e) { toast.error(e.message); }
+      const dt = new Date(schedDate);
+      dt.setHours(h, 0, 0, 0);
+      const scheduled_at = dt.toISOString();
+      await postNow(campaign.post_id, platform, scheduled_at);
+      toast.success(`Posting to ${PLATFORM_META[platform]?.label}…`);
+      await refresh();
+      // Polling effect now watches campaign[`${platform}_published_status`] for 'posted'
+      // and clears publishingState when it lands. No further action needed here.
+    } catch (e) {
+      toast.error(e.message);
+      setPublishingState(null);
+    }
     finally { setBusy(null); }
-  }
+  };
 
-  const captionWordCount = remoteCaption ? remoteCaption.trim().split(/\s+/).length : 0;
-  const readability = Math.max(40, Math.min(100, 100 - Math.abs(120 - captionWordCount) / 2));
-  const canPublish = !!recordId && !!remoteCaption && !generating && !isLocked;
+  const handleSchedule = async (platform = activePlatform, scheduled_at = null) => {
+    if (!campaign) return;
+    if (!scheduled_at) {
+      let h = parseInt(schedHour, 10) || 0;
+      if (schedAmpm === 'PM' && h < 12) h += 12;
+      if (schedAmpm === 'AM' && h === 12) h = 0;
+      const dt = new Date(schedDate);
+      dt.setHours(h, 0, 0, 0);
+      scheduled_at = dt.toISOString();
+    }
+    setBusy(`schedule-${platform}`);
+    setPublishingState({ platform, action: 'schedule', startedAt: Date.now() });
+    window.scrollTo(0, 0);
+    try {
+      await schedulePlatform(campaign.post_id, platform, scheduled_at);
+      toast.success(`Scheduled on ${PLATFORM_META[platform]?.label}`);
+      await refresh();
+    } catch (e) {
+      toast.error(e.message);
+      setPublishingState(null);
+    }
+    finally { setBusy(null); }
+  };
+
+  /* ---------- /Action wiring ---------- */
+
+  // For new post (no campaign) with no platforms — bounce back
+  useEffect(() => {
+    if (!isEditing && platforms.length === 0) {
+      onClose?.();
+    }
+  }, [isEditing, platforms.length, onClose]);
+
+  // Derived UI for the Generating overlay — elapsed seconds, remaining, and step label
+  const elapsedSeconds = generating && genStartedAt
+    ? Math.floor((nowMs - genStartedAt) / 1000)
+    : 0;
+  const remainingSeconds = Math.max(0, ESTIMATED_GEN_SECONDS - elapsedSeconds);
+  const progressPct = Math.min(100, (elapsedSeconds / ESTIMATED_GEN_SECONDS) * 100);
+
+  // Live status — derived from what's in the campaign row right now
+  const generationStatus = (() => {
+    if (!generating) return null;
+    const row = pendingPostId ? campaigns.find(c => c.post_id === pendingPostId) : campaign;
+    if (!row) return 'Creating campaign in Supabase…';
+    const imageReady = row.post_type === 'event'
+      ? (row.source_image_urls?.length > 0)
+      : (row.generated_image_variants?.length > 0);
+    const ps = row.platforms_selected || [];
+    const captionsDone = ps.filter(p => !!row[`${p}_caption`]).length;
+    if (!imageReady) return 'Generating image…';
+    if (captionsDone < ps.length) return `Writing captions… (${captionsDone}/${ps.length})`;
+    return 'Finalising…';
+  })();
 
   return (
     <>
       <header className="sticky top-0 z-20 glass border-b border-cream-300/60">
-        <div className="px-10 h-16 flex items-center gap-4">
-          <div className="h-display text-2xl text-ink-900 ">Post Creator</div>
-          {/* <span className="text-[11px] uppercase tracking-[0.16em] font-semibold bg-brand-100 text-brand-700 rounded-full px-2.5 py-1 inline-flex items-center gap-1.5">
-            <span className="h-1.5 w-1.5 rounded-full bg-brand-700 animate-pulse-soft" />
+        <div className="px-4 lg:px-10 h-16 flex items-center gap-3">
+          <button
+            onClick={onClose}
+            className="rounded-full h-10 w-10 bg-white border border-cream-300 flex items-center justify-center text-ink-700 hover:bg-cream-100 transition-all"
+            aria-label="Back"
+          >
+            <svg viewBox="0 0 24 24" className="h-4 w-4" fill="none" stroke="currentColor" strokeWidth="2.5">
+              <path d="M15 18l-6-6 6-6" strokeLinecap="round" strokeLinejoin="round" />
+            </svg>
+          </button>
 
-          </span> */}
-          {generating && (
-            <span className="text-xs text-accent-blue inline-flex items-center gap-2 ml-2 animate-fade-in">
-              <Spinner /> Workflow running…
-            </span>
-          )}
+          <PlatformChipStrip platforms={platforms} campaign={campaign} />
+
+          <div className="flex-1" />
+
+          <button
+            onClick={onClose}
+            className="rounded-full h-10 w-10 bg-white border border-cream-300 flex items-center justify-center text-ink-700 hover:bg-cream-100 transition-all"
+            aria-label="Close"
+          >
+            <svg viewBox="0 0 24 24" className="h-4 w-4" fill="none" stroke="currentColor" strokeWidth="2.5">
+              <path d="M6 6l12 12M6 18L18 6" strokeLinecap="round" />
+            </svg>
+          </button>
         </div>
       </header>
 
-      <main className="px-4 lg:px-10 py-6 grid grid-cols-1 lg:grid-cols-[1fr_360px] gap-8 max-w-7xl w-full mx-auto">
-        {/* LEFT — editor */}
-        <div className="space-y-6 stagger min-w-0">
-
-          {/* Occasion / Event Name */}
-          <Section title="Occasion / Event Name">
-            <input
-              value={form.eventName}
-              onChange={set('eventName')}
-              disabled={isLocked}
-              placeholder="Occasion / Event Name..."
-              className="input text-lg lg:text-xl h-display font-bold placeholder:text-ink-900/30"
-            />
-            <div className="mt-3 flex items-center gap-3">
-              <Field label="Date" className="w-full sm:w-44">
-                <input type="date" value={form.date} onChange={set('date')} disabled={isLocked} className="input" />
-              </Field>
-            </div>
-          </Section>
-
-          {/* Step 2 — Post Type */}
-          <Section title="Post Type">
-            <div className="grid grid-cols-1 sm:grid-cols-3 gap-3">
-              {POST_TYPES.map((t) => {
-                const active = form.postType === t;
-                return (
-                  <button
-                    key={t}
-                    onClick={() => !isLocked && setForm({ ...form, postType: t })}
-                    disabled={isLocked}
-                    className={[
-                      'relative rounded-xl border px-4 py-3 text-left overflow-hidden min-h-[70px]',
-                      'transition-all duration-300 ease-snap will-change-transform',
-                      active
-                        ? 'bg-gradient-to-br from-brand-100 to-brand-50 border-brand-300 text-brand-700 shadow-glow scale-[1.01]'
-                        : 'bg-white border-cream-300/60 text-ink-700 hover:border-brand-200 hover:-translate-y-0.5 hover:shadow-soft'
-                    ].join(' ')}
-                  >
-                    {active && (
-                      <span className="absolute top-2 right-2 h-2 w-2 rounded-full bg-brand-700 animate-pulse-soft" />
-                    )}
-                    <div className="font-semibold flex items-center gap-2">
-                      <PostTypeIcon type={t} />
-                      {t}
-                    </div>
-                    <div className="text-[10px] lg:text-xs text-ink-500 mt-1 uppercase lg:capitalize tracking-tight">
-                      {t === 'Observance' && (window.innerWidth < 640 ? 'AI Visual' : 'AI-generated visual')}
-                      {t === 'Event' && (window.innerWidth < 640 ? '1–5 links' : '1–5 image links')}
-                      {t === 'Collage' && (window.innerWidth < 640 ? '1–5 links' : '1–5 image links')}
-                    </div>
-                  </button>
-                );
-              })}
-            </div>
-
-            {/* Conditional panel */}
-            <div key={form.postType} className="mt-5 animate-fade-up">
-              {form.postType === 'Observance' && (
-                <ObservancePanel form={form} set={set} disabled={isLocked} />
-              )}
-              {form.postType === 'Event' && (
-                <LinksPanel
-                  title="Image Links"
-                  hint="Add 1 or more images (max 5)"
-                  form={form}
-                  set={set}
-                  items={form.imageItems}
-                  onItemsChange={setImageItems}
-                  min={1}
-                  max={5}
-                  valid={linksValid}
-                  validHint={linkCount >= 1 ? `${linkCount} image${linkCount === 1 ? '' : 's'} attached` : 'Need at least 1 image'}
-                  disabled={isLocked}
-                  toast={toast}
-                />
-              )}
-              {form.postType === 'Collage' && (
-                <LinksPanel
-                  title="Collage Image Links"
-                  hint="Provide 1 to 5 images for the collage"
-                  form={form}
-                  set={set}
-                  items={form.imageItems}
-                  onItemsChange={setImageItems}
-                  min={1}
-                  max={5}
-                  valid={linksValid}
-                  validHint={`${linkCount} image${linkCount === 1 ? '' : 's'} — ${linksValid ? 'looks good' : 'need 1 to 5'}`}
-                  disabled={isLocked}
-                  toast={toast}
-                />
-              )}
-            </div>
-          </Section>
-
-          {/* Step 3 — Caption Style */}
-          <Section step="3" title="Caption Style">
-            <div className="grid grid-cols-2 sm:grid-cols-4 gap-2">
-              {CAPTION_STYLES.map((s) => {
-                const active = form.captionStyle === s;
-                return (
-                  <button
-                    key={s}
-                    onClick={() => !isLocked && setForm({ ...form, captionStyle: s })}
-                    disabled={isLocked}
-                    className={[
-                      'rounded-lg border px-3 py-2.5 text-sm relative overflow-hidden',
-                      'transition-all duration-200 ease-snap',
-                      active
-                        ? 'bg-gradient-to-br from-brand-100 to-brand-50 border-brand-300 text-brand-700 font-semibold shadow-soft'
-                        : 'bg-white border-cream-300/60 text-ink-700 hover:border-brand-200 hover:-translate-y-0.5'
-                    ].join(' ')}
-                  >
-                    {s}
-                  </button>
-                );
-              })}
-            </div>
-          </Section>
-
-          {/* Generate Content — single CTA */}
-          <div className="card p-6 relative overflow-hidden">
-            {generating && (
-              <div className="absolute inset-x-0 top-0 h-1 bg-cream-200 overflow-hidden">
-                <div className="h-full bg-brand-gradient origin-left animate-progress-indet" />
+      <main className="px-4 lg:px-10 py-6 lg:py-8 max-w-7xl w-full mx-auto">
+        <div className="grid grid-cols-1 lg:grid-cols-[1fr_360px] gap-8 min-w-0">
+          {/* LEFT — shared inputs + per-tab content */}
+          <div className="space-y-6 stagger min-w-0">
+            <div className="rounded-xl border border-cream-300/60 bg-cream-50 px-4 py-3 text-sm text-ink-700 flex items-start gap-2">
+              <svg viewBox="0 0 24 24" className="h-4 w-4 mt-0.5 shrink-0 text-brand-600" fill="none" stroke="currentColor" strokeWidth="2">
+                <path d="M12 3l2 5 5 2-5 2-2 5-2-5-5-2 5-2 2-5z" strokeLinejoin="round" />
+              </svg>
+              <div>
+                <strong className="text-ink-900">One image, per-platform captions.</strong> Create Content generates a single visual shared across all {platforms.length || ''} selected platforms, plus a tailored caption for each. Switch tabs to review or override each platform's caption.
               </div>
+            </div>
+
+            {/* Shared section */}
+            <Section title="Occasion / Event Name" tint>
+              <input
+                value={form.eventName}
+                onChange={set('eventName')}
+                disabled={readOnly}
+                readOnly={readOnly}
+                placeholder="Occasion / Event Name…"
+                className="input text-lg lg:text-xl h-display font-bold placeholder:text-ink-900/30"
+              />
+              <div className="mt-3 flex items-center gap-3">
+                <Field label="Date" className="w-full sm:w-44">
+                  <input type="date" value={form.date} onChange={set('date')} disabled={readOnly} readOnly={readOnly} className="input" />
+                </Field>
+              </div>
+            </Section>
+
+            <Section title="Post Type" tint>
+              <div className="grid grid-cols-1 sm:grid-cols-3 gap-3">
+                {POST_TYPES.map((t) => {
+                  const active = form.postType === t;
+                  return (
+                    <button
+                      key={t}
+                      onClick={() => !readOnly && setForm(f => ({ ...f, postType: t }))}
+                      disabled={readOnly}
+                      className={[
+                        'relative rounded-xl border px-4 py-3 text-left overflow-hidden min-h-[70px] transition-all',
+                        active
+                          ? 'bg-gradient-to-br from-brand-100 to-brand-50 border-brand-300 text-brand-700 shadow-glow'
+                          : 'bg-white border-cream-300/60 text-ink-700 hover:border-brand-200',
+                        readOnly ? 'cursor-default' : 'cursor-pointer'
+                      ].join(' ')}
+                    >
+                      {active && (
+                        <span className="absolute top-2 right-2 h-2 w-2 rounded-full bg-brand-700 animate-pulse-soft" />
+                      )}
+                      <div className="font-semibold flex items-center gap-2">
+                        <PostTypeIcon type={t} />
+                        {POST_TYPE_LABELS[t]}
+                      </div>
+                      <div className="text-[10px] lg:text-xs text-ink-500 mt-1 uppercase tracking-tight">
+                        {t === 'observance' && 'AI-GENERATED VISUAL'}
+                        {t === 'event' && '1–5 IMAGE LINKS'}
+                        {t === 'collage' && '1–5 IMAGE LINKS'}
+                      </div>
+                    </button>
+                  );
+                })}
+              </div>
+
+              {/* Image Links uploader — only for event / collage */}
+              {(form.postType === 'event' || form.postType === 'collage') && (
+                <ImageLinksUploader
+                  images={form.sourceImages}
+                  onChange={(nextOrFn) => setForm(f => ({
+                    ...f,
+                    sourceImages: typeof nextOrFn === 'function' ? nextOrFn(f.sourceImages) : nextOrFn
+                  }))}
+                  max={5}
+                  disabled={readOnly}
+                />
+              )}
+
+              {/* Image personal touch — observance only (collage/event use user-supplied images,
+                  so the AI-image hint doesn't apply). */}
+              {form.postType === 'observance' && (
+                <div className="mt-5 rounded-xl bg-gradient-to-br from-cream-100 to-cream-50 border border-cream-300/60 p-4">
+                  <Field label="Image Personal Touch (optional)" hint="Notes that shape the visual — mood, brand colors, composition, lighting.">
+                    <textarea
+                      rows={2}
+                      value={form.imagePrompt}
+                      onChange={set('imagePrompt')}
+                      disabled={readOnly}
+                      readOnly={readOnly}
+                      placeholder="Mood, brand colors, style…"
+                      className="input text-sm"
+                    />
+                  </Field>
+                </div>
+              )}
+
+            </Section>
+
+            {form.postType !== 'event' && (
+              <ImageWorkbench
+                campaign={campaign}
+                postType={form.postType}
+                readOnly={readOnly}
+                variantIdx={variantIdx}
+                onSelectVariant={handleSelectVariant}
+                onRegenerateImage={isEditing && form.postType === 'observance' ? handleRegenerateImage : null}
+                onRegenerateVariants={null}
+                busy={busy}
+                locked={isEditing && platforms.some(p => campaign?.[`${p}_published_status`] === 'posted')}
+              />
             )}
-            <div className="flex items-center justify-between gap-6 flex-wrap">
-              <div className="min-w-0">
-                <h3 className="h-display text-xl text-ink-900">Generate Content</h3>
-                <p className="text-sm text-ink-600 mt-1">
-                  {generating
-                    ? 'Workflow is running. Sit tight — we\'ll open the pipeline when it\'s ready.'
-                    : 'Submit your idea and let AI create the content'}
-                </p>
-                {generating && (
-                  <div className="mt-2 flex flex-wrap gap-2 text-xs text-ink-500">
-                    <Pill>Event Name</Pill>
-                    <Pill>Post Type</Pill>
-                    <Pill>Caption Style</Pill>
-                    {form.postType !== 'Observance' && <Pill>Image Links</Pill>}
-                  </div>
-                )}
-              </div>
-              <button
-                onClick={doGenerate}
-                disabled={!canGenerate}
-                className="btn-primary inline-flex items-center gap-2 px-6 py-3 text-base"
-              >
-                {generating ? (
-                  <>
-                    <Spinner /> Running workflow…
-                  </>
-                ) : (
-                  <>
-                    <SparkleIcon /> {recordId ? 'Regenerate Content' : 'Generate Content'}
-                  </>
-                )}
-              </button>
-            </div>
-          </div>
 
-          {/* Preview State Button Block */}
-          {(timer > 0 || showPreviewBtn) && (
-            <div className="mt-4 animate-fade-up">
-              <button
-                disabled={timer > 0}
-                onClick={openPreview}
-                className={`w-full rounded-xl p-4 flex items-center justify-between transition-all duration-300 shadow-sm border ${timer > 0
-                  ? 'bg-cream-100 border-cream-200 cursor-not-allowed opacity-80 shadow-none'
-                  : 'bg-brand-50 border-brand-200 group hover:bg-brand-100 cursor-pointer shadow-md'
-                  }`}
-              >
-                <div className="flex items-center gap-3">
-                  <div className={`h-10 w-10 rounded-full flex items-center justify-center text-white shadow-soft transition-all ${timer > 0 ? 'bg-brand-700' : 'bg-brand-gradient group-hover:scale-110'
-                    }`}>
-                    {timer > 0 ? (
-                      <div className="text-[10px] font-bold">{timer}s</div>
-                    ) : (
-                      <SparkleIcon />
-                    )}
+            {/* Shared Caption Style — applies to all selected platforms */}
+            {platforms.length > 0 && (
+              <Section title="Caption Style" subtitle="Shared style — Create Content uses this base for every platform" tint>
+                <div className="grid grid-cols-2 sm:grid-cols-4 gap-2">
+                  {CAPTION_STYLES.map((s) => {
+                    const active = form.captionStyle === s;
+                    return (
+                      <button
+                        key={s}
+                        onClick={() => !readOnly && setForm(f => ({ ...f, captionStyle: s }))}
+                        disabled={readOnly}
+                        className={[
+                          'rounded-lg border px-3 py-2.5 text-sm transition-all',
+                          active
+                            ? 'bg-gradient-to-br from-brand-100 to-brand-50 border-brand-300 text-brand-700 font-semibold shadow-soft'
+                            : 'bg-white border-cream-300/60 text-ink-700 hover:border-brand-200 hover:-translate-y-0.5',
+                          readOnly ? 'cursor-default' : 'cursor-pointer'
+                        ].join(' ')}
+                      >
+                        {s}
+                      </button>
+                    );
+                  })}
+                </div>
+
+                {/* Caption personal touch — single brief shared across ALL platforms */}
+                <div className="mt-5 rounded-xl bg-gradient-to-br from-cream-100 to-cream-50 border border-cream-300/60 p-4">
+                  <Field label="Caption Personal Touch (optional)" hint="A single brief applied to every platform's caption — tone, key phrases, hashtags, mentions, calls-to-action.">
+                    <textarea
+                      rows={2}
+                      value={form.captionPrompt}
+                      onChange={set('captionPrompt')}
+                      disabled={readOnly}
+                      readOnly={readOnly}
+                      placeholder="Tone, key phrases, hashtags, mentions…"
+                      className="input text-sm"
+                    />
+                  </Field>
+                </div>
+              </Section>
+            )}
+
+            {/* Per-platform caption cards (one row per selected platform) */}
+            {isEditing && platforms.length > 0 && (
+              <section className="card p-6">
+                <div className="mb-4">
+                  <div className="text-[11px] uppercase tracking-[0.18em] text-ink-500 font-bold">Captions</div>
+                  <div className="text-xs text-ink-500 mt-1">One row per platform · review, regenerate, edit or accept</div>
+                </div>
+                <div className="space-y-4">
+                  {platforms.map(pid => (
+                    <PlatformCaptionCard
+                      key={pid}
+                      platform={pid}
+                      campaign={campaign}
+                      form={form}
+                      setForm={setForm}
+                      editingPlatform={editingPlatform}
+                      setEditingPlatform={setEditingPlatform}
+                      draftEdit={draftEdit}
+                      setDraftEdit={setDraftEdit}
+                      busy={busy}
+                      onRegenerate={(p) => handleRegenerateCaption(p)}
+                      onSaveEdit={(text, p) => handleSaveCaption(text, p)}
+                      onApprove={(p) => handleApprove(p)}
+                      approvalDirty={!!approvalDirty[pid]}
+                    />
+                  ))}
+                </div>
+              </section>
+            )}
+
+            {/* Empty state when composing a new post — captions will populate after Create Content */}
+            {!isEditing && platforms.length > 0 && (
+              <section className="card p-6 border-dashed border-2 border-cream-300/60 bg-cream-50">
+                <div className="text-center py-8">
+                  <div className="font-bold text-ink-900">Captions appear after Create Content</div>
+                  <div className="text-sm text-ink-500 mt-1.5 max-w-md mx-auto">
+                    Once you hit <strong>Create Content</strong>, one tailored caption per selected platform will land here — each with its own Approve / Regenerate / Edit controls.
                   </div>
-                  <div className="text-left">
-                    <div className="font-bold text-ink-900 leading-tight">
-                      {timer > 0 ? 'Your preview is about to be ready, waiting for a minute' : 'Preview Now'}
-                    </div>
-                    <div className="text-xs text-brand-600 mt-0.5 font-medium">
-                      {timer > 0 ? 'AI is stitching your visual & caption...' : 'Click to see how it looks on LinkedIn'}
-                    </div>
+                  <div className="mt-4 flex flex-wrap items-center justify-center gap-2">
+                    {platforms.map(pid => (
+                      <span key={pid} className="rounded-full bg-white border border-cream-300 px-3 py-1.5 text-xs font-semibold inline-flex items-center gap-2"
+                        style={{ color: PLATFORM_META[pid].color }}>
+                        <PlatformGlyph platform={pid} className="h-3.5 w-3.5" />
+                        {PLATFORM_META[pid].label}
+                      </span>
+                    ))}
                   </div>
                 </div>
-                {!showPreviewBtn ? (
-                  <div className="h-2 w-12 bg-brand-100 rounded-full overflow-hidden">
-                    <div className="h-full bg-brand-600 animate-progress-indet origin-left" />
+              </section>
+            )}
+
+            {/* Create Content CTA — only when composing a new post */}
+            {!isEditing && (
+              <div className="rounded-2xl overflow-hidden border border-brand-300 shadow-glow">
+                <div className="bg-brand-gradient text-white px-6 py-5 flex items-center justify-between gap-6 flex-wrap">
+                  <div>
+                    <h3 className="h-display text-2xl">Generate Content</h3>
+                    <p className="text-sm text-brand-100/95 mt-1">
+                      {generating
+                        ? 'Workflow running — image and captions on the way…'
+                        : `Generate one image + ${platforms.length} caption${platforms.length === 1 ? '' : 's'} in parallel.`}
+                    </p>
                   </div>
-                ) : (
-                  <div className="h-8 w-8 rounded-full bg-white border border-brand-200 flex items-center justify-center text-brand-700 group-hover:bg-brand-700 group-hover:text-white transition-colors">
-                    <svg viewBox="0 0 24 24" className="h-4 w-4" fill="none" stroke="currentColor" strokeWidth="2.5">
-                      <path d="M9 18l6-6-6-6" strokeLinecap="round" strokeLinejoin="round" />
-                    </svg>
-                  </div>
-                )}
-              </button>
-            </div>
-          )}
+                  <button
+                    onClick={handleForge}
+                    disabled={busy === 'forge' || generating}
+                    className="bg-white text-brand-700 px-6 py-3 rounded-xl font-semibold inline-flex items-center gap-2 hover:bg-cream-100 disabled:opacity-60 disabled:cursor-not-allowed transition-all"
+                  >
+                    {busy === 'forge' || generating ? <Spinner /> : <SparkleIcon />}
+                    {generating ? 'Running workflow…' : 'Create Content'}
+                  </button>
+                </div>
+              </div>
+            )}
+          </div>
 
-        </div>
+          {/* RIGHT — preview + schedule */}
+          <aside className="space-y-5 stagger">
+            {platforms.length > 0 ? (
+              <div className="space-y-3">
+                <div className="flex flex-wrap items-center gap-1.5">
+                  <span className="text-[10px] uppercase tracking-wider font-bold text-ink-500 mr-1">Preview:</span>
+                  {platforms.map(pid => {
+                    const m = PLATFORM_META[pid];
+                    const active = activePlatform === pid;
+                    return (
+                      <button
+                        key={pid}
+                        onClick={() => setActivePlatform(pid)}
+                        style={active ? { background: m.color, color: '#fff', borderColor: m.color } : { color: m.color }}
+                        className={[
+                          'inline-flex items-center gap-1 rounded-full border px-2.5 py-1 text-[11px] font-semibold transition-all',
+                          active ? 'shadow-soft' : 'bg-white border-cream-300/60 hover:border-current'
+                        ].join(' ')}
+                      >
+                        <PlatformGlyph platform={pid} className="h-3 w-3" />
+                        {m.label}
+                      </button>
+                    );
+                  })}
+                </div>
+                <PreviewSwitcher
+                  platform={activePlatform}
+                  caption={form.captionOverrides[activePlatform] ?? caption}
+                  images={images}
+                  eventName={form.eventName}
+                />
+                <button
+                  type="button"
+                  onClick={() => {
+                    window.scrollTo({ top: 0, behavior: 'smooth' });
+                    setPreviewModalOpen(true);
+                  }}
+                  className="w-full btn-ghost text-xs px-3 py-2 inline-flex items-center justify-center gap-1.5 hover:border-brand-300 hover:text-brand-700"
+                >
+                  <ExpandIcon /> Preview Post
+                </button>
+              </div>
+            ) : (
+              <div className="rounded-2xl border border-dashed border-cream-300 bg-white p-8 text-center text-sm text-ink-500">
+                Pick at least one platform.
+              </div>
+            )}
 
-        {/* RIGHT — preview only */}
-        <aside className="space-y-5 stagger">
-          <LinkedInPost
-            caption={remoteCaption}
-            images={previewImages}
-            eventName={form.eventName}
-            isSidebar
-            generating={generating && (form.postType === 'Observance' || form.postType === 'Collage')}
-            blurred={!recordId}
-            onClick={openPreview}
-          />
-
-          <div className="rounded-2xl bg-gradient-to-br from-blue-50 to-cream-50 border border-blue-100 p-5 relative overflow-hidden">
-            <div className="absolute -top-10 -right-10 h-32 w-32 rounded-full bg-blue-100/40 blur-2xl" />
-            <div className="relative">
+            <div className="rounded-2xl bg-gradient-to-br from-blue-50 to-cream-50 border border-blue-100 p-5">
               <div className="flex items-center gap-2 text-accent-blue font-semibold">
                 <span className="h-7 w-7 rounded-lg bg-accent-blue text-white flex items-center justify-center">
                   <svg viewBox="0 0 24 24" className="h-4 w-4" fill="none" stroke="currentColor" strokeWidth="2.5">
@@ -559,462 +802,714 @@ export default function PostCreator({ data, onNavigate, initialRecordId }) {
                 </span>
                 Schedule Post
               </div>
-              <p className="text-sm text-ink-700 mt-2.5">
-                {isLocked
-                  ? 'This post has already been published to LinkedIn.'
-                  : canPublish
-                    ? 'Post is ready. Publish straight to LinkedIn or schedule a drop.'
-                    : 'Run Generate Content first, then publish or schedule from here.'}
+              <p className="text-xs text-ink-700 mt-2">
+                {!isEditing
+                  ? 'Run Generate Content first, then publish or schedule from here.'
+                  : published === 'posted'
+                    ? `${activeMeta?.label || 'This platform'} has already been published — Post Now and Schedule are locked.`
+                    : `Publish now or pick a date + time to schedule on ${activeMeta?.label || 'the active platform'}.`}
               </p>
-              <button
-                onClick={doPostNow}
-                disabled={!canPublish || busy === 'post'}
-                className="mt-4 w-full btn-blue inline-flex items-center justify-center gap-2 disabled:opacity-50"
-              >
-                {busy === 'post' ? <Spinner /> : <SendIcon />} Post Now
-              </button>
-              <div className="mt-4 space-y-3">
-                <div className="flex flex-wrap items-center gap-2">
-                  <div className="flex-1 min-w-[140px]">
-                    <input
-                      type="date"
-                      value={schedDate}
-                      onChange={(e) => setSchedDate(e.target.value)}
-                      disabled={isLocked}
-                      className="input w-full"
-                    />
-                  </div>
-                  <div className="flex items-center gap-1">
-                    <select
-                      value={schedHour}
-                      onChange={(e) => setSchedHour(e.target.value)}
-                      disabled={isLocked}
-                      className="input w-16 px-2 text-center"
-                    >
-                      {[1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12].map(h => (
-                        <option key={h} value={h}>{h}</option>
-                      ))}
-                    </select>
-                    <select
-                      value={schedAmpm}
-                      onChange={(e) => setSchedAmpm(e.target.value)}
-                      disabled={isLocked}
-                      className="input w-16 px-1 text-center font-bold"
-                    >
-                      <option value="AM">AM</option>
-                      <option value="PM">PM</option>
-                    </select>
-                  </div>
+
+              {published === 'posted' && postedAt && (
+                <div className="mt-3 rounded-lg bg-green-50 border border-green-100 px-3 py-2 text-[11px] text-accent-green flex items-center gap-2">
+                  <svg viewBox="0 0 24 24" className="h-3.5 w-3.5" fill="none" stroke="currentColor" strokeWidth="2.5">
+                    <circle cx="12" cy="12" r="9" /><path d="M8 12l3 3 5-6" strokeLinecap="round" strokeLinejoin="round" />
+                  </svg>
+                  <span>Posted <strong>{new Date(postedAt).toLocaleString()}</strong></span>
                 </div>
-                <button
-                  onClick={doSchedule}
-                  disabled={!canPublish || busy === 'schedule' || !schedDate}
-                  className="w-full btn-ghost border-blue-200 text-accent-blue font-bold inline-flex items-center justify-center gap-2 disabled:opacity-50 hover:bg-blue-50"
-                >
-                  {busy === 'schedule' ? <Spinner /> : <ClockIcon />}
-                  Schedule Post
-                </button>
+              )}
+
+              {/* Post Now — ships the active platform immediately */}
+              <button
+                onClick={() => handlePostNow(activePlatform)}
+                disabled={!isEditing || !caption || busy === `post-${activePlatform}` || published === 'posted'}
+                className="mt-4 w-full bg-gradient-to-r from-accent-blue to-blue-500 hover:from-blue-600 hover:to-blue-500 text-white font-bold rounded-lg px-4 py-2.5 inline-flex items-center justify-center gap-2 transition-all shadow-soft hover:shadow-lift disabled:opacity-50 disabled:cursor-not-allowed disabled:shadow-none disabled:bg-gradient-to-r disabled:from-cream-300 disabled:to-cream-300 disabled:text-ink-500"
+              >
+                {busy === `post-${activePlatform}` ? <Spinner /> : <SendIcon />}
+                {published === 'posted' ? 'Already Posted' : 'Post Now'}
+              </button>
+
+              <div className="mt-3 flex flex-wrap items-center gap-2">
+                <input
+                  type="date"
+                  value={schedDate}
+                  onChange={(e) => setSchedDate(e.target.value)}
+                  disabled={!isEditing || published === 'posted'}
+                  className="input flex-1 min-w-[140px]"
+                />
+                <div className="flex items-center gap-1">
+                  <select value={schedHour} onChange={(e) => setSchedHour(e.target.value)} disabled={!isEditing || published === 'posted'} className="input w-16 px-2 text-center">
+                    {[1,2,3,4,5,6,7,8,9,10,11,12].map(h => <option key={h} value={h}>{h}</option>)}
+                  </select>
+                  <select value={schedAmpm} onChange={(e) => setSchedAmpm(e.target.value)} disabled={!isEditing || published === 'posted'} className="input w-16 px-1 text-center font-bold">
+                    <option value="AM">AM</option>
+                    <option value="PM">PM</option>
+                  </select>
+                </div>
               </div>
-            </div>
-          </div>
 
-          {/* <div className="card p-5">
-            <div className="text-[11px] uppercase tracking-[0.18em] text-ink-500 font-semibold mb-2">Post Optimization</div>
-            <div className="flex items-center justify-between">
-              <span className="text-ink-700">Readability Score</span>
-              <span className="text-brand-700 font-semibold tabular-nums">{Math.round(readability)}/100</span>
+              <button
+                onClick={() => handleSchedule()}
+                disabled={!isEditing || !caption || busy === `schedule-${activePlatform}` || published === 'posted'}
+                className="mt-3 w-full btn-ghost border-blue-200 text-accent-blue font-bold inline-flex items-center justify-center gap-2 disabled:opacity-50 disabled:cursor-not-allowed disabled:border-cream-300 disabled:text-ink-500"
+              >
+                {busy === `schedule-${activePlatform}` ? <Spinner /> : <ClockIcon />}
+                {published === 'posted' ? 'Already Posted' : `Schedule on ${activeMeta?.label || 'platform'}`}
+              </button>
             </div>
-            <div className="mt-2 h-2 rounded-full bg-cream-200 overflow-hidden">
-              <div
-                className="h-full bg-gradient-to-r from-brand-500 to-brand-700 rounded-full transition-[width] duration-700 ease-snap"
-                style={{ width: `${readability}%` }}
-              />
-            </div>
-            <div className="mt-3 flex items-center gap-2 text-xs text-accent-green">
-              <svg viewBox="0 0 24 24" className="h-4 w-4" fill="none" stroke="currentColor" strokeWidth="2">
-                <circle cx="12" cy="12" r="9" /><path d="M8 12l3 3 5-6" strokeLinecap="round" strokeLinejoin="round" />
-              </svg>
-              Optimized for LinkedIn Algorithm
-            </div>
-          </div> */}
-
-          {/* <button
-            onClick={saveDraft}
-            disabled={!recordId || busy === 'save'}
-            className="w-full btn-ghost inline-flex items-center justify-center gap-2 disabled:opacity-50"
-          >
-            {busy === 'save' ? <Spinner /> : <SaveIcon />} Save Draft
-          </button> */}
-        </aside>
+          </aside>
+        </div>
       </main>
 
-      {/* LinkedIn Preview Modal */}
-      {showModal && createPortal(
-        <LinkedInModal
-          onClose={() => setShowModal(false)}
-          caption={remoteCaption || "Writing your caption..."}
-          images={previewImages}
+      {generating && (
+        <GeneratingOverlay
+          elapsed={elapsedSeconds}
+          remaining={remainingSeconds}
+          estimated={ESTIMATED_GEN_SECONDS}
+          pct={progressPct}
+          status={generationStatus}
+          onClose={() => {
+            // Close the overlay; polling effects stop on their own when `generating` flips false.
+            // The campaign row keeps being written by n8n in the background — the user can
+            // refresh the dashboard / Schedule page later to see the finished post.
+            setGenerating(false);
+            setGenStartedAt(null);
+            setPendingPostId(null);
+            toast.success('Continuing in background — the post will appear once ready.');
+          }}
+        />
+      )}
+
+      {previewModalOpen && (
+        <PreviewModal
+          platform={activePlatform}
+          caption={form.captionOverrides[activePlatform] ?? caption}
+          images={images}
           eventName={form.eventName}
-        />,
-        document.body
+          onClose={() => setPreviewModalOpen(false)}
+        />
+      )}
+
+      {publishingState && (
+        <PublishingOverlay
+          platform={publishingState.platform}
+          action={publishingState.action}
+          elapsed={Math.floor((publishingNowMs - publishingState.startedAt) / 1000)}
+        />
       )}
     </>
   );
 }
 
-/* ----- sub-panels per post type ----- */
+function PublishingOverlay({ platform, action, elapsed }) {
+  const meta = PLATFORM_META[platform] || { label: platform, color: '#b83a25' };
+  const title = action === 'post'
+    ? `Publishing to ${meta.label}`
+    : `Scheduling on ${meta.label}`;
+  const sub = action === 'post'
+    ? 'Sending to the platform and waiting for confirmation from n8n…'
+    : 'Queueing your post and waiting for Supabase to reflect the scheduled time…';
+  const waitingFor = action === 'post' ? 'posted' : 'scheduled';
 
-function ObservancePanel({ form, set, disabled }) {
+  // Lock body scroll while the overlay is up, matching GeneratingOverlay behavior.
+  useEffect(() => {
+    const prev = document.body.style.overflow;
+    document.body.style.overflow = 'hidden';
+    return () => { document.body.style.overflow = prev; };
+  }, []);
+
   return (
-    <div className="rounded-xl bg-gradient-to-br from-cream-100 to-cream-50 border border-cream-300/60 p-4">
-      <Field label="Personal Touch (optional)">
-        <textarea
-          rows={2}
-          value={form.imagePrompt}
-          onChange={set('imagePrompt')}
-          disabled={disabled}
-          placeholder="Mood, brand colors, style…"
-          className="input text-sm"
-        />
-      </Field>
-      <div className="mt-2 text-xs text-ink-500">
-        AI will craft the visual using the event name above.
+    <div className="fixed inset-0 z-50 bg-ink-900/55 backdrop-blur-sm overflow-y-auto animate-fade-in">
+      <div className="min-h-screen flex items-center justify-center p-4">
+        <div className="bg-white rounded-3xl shadow-2xl p-7 max-w-md w-full text-center border border-cream-200 my-4">
+          <div
+            className="h-20 w-20 rounded-full mx-auto flex items-center justify-center mb-5 shadow-glow"
+            style={{ background: meta.color }}
+          >
+            <Spinner className="h-8 w-8 text-white" />
+          </div>
+
+          <h2 className="h-display text-2xl text-ink-900">{title}</h2>
+          <p className="text-sm text-ink-600 mt-2">{sub}</p>
+
+          <div className="mt-5 inline-flex items-center gap-2 rounded-full bg-cream-100 px-4 py-2 text-xs font-semibold text-ink-700">
+            <span className="h-1.5 w-1.5 rounded-full animate-pulse-soft" style={{ background: meta.color }} />
+            Waiting for status: <code className="font-mono text-ink-900">{waitingFor}</code>
+          </div>
+
+          <div className="mt-4 text-xs text-ink-500 tabular-nums">
+            <strong className="text-ink-900">{elapsed}s</strong> elapsed
+          </div>
+
+          <p className="text-[11px] text-ink-500 mt-5">
+            This overlay closes automatically as soon as Supabase shows <code className="font-mono">{platform}_published_status = '{waitingFor}'</code>.
+          </p>
+        </div>
       </div>
     </div>
   );
 }
 
-function LinksPanel({ title, hint, form, set, items, onItemsChange, min, max, valid, validHint, disabled, toast }) {
-  const [uploading, setUploading] = useState(false);
-  const [mode, setMode] = useState('upload'); // 'upload' or 'link'
-  const fileInputRef = useRef(null);
+function PreviewModal({ platform, caption, images, eventName, onClose }) {
+  const meta = PLATFORM_META[platform];
 
-  const handleUpload = async (files) => {
-    if (disabled || uploading) return;
-    if (files.length === 0) return;
-
-    if (items.filter(it => it.value).length + files.length > max) {
-      toast.error(`Maximum ${max} images allowed`);
-      return;
-    }
-
-    setUploading(true);
-    try {
-      const imagesPayload = await Promise.all(
-        Array.from(files).map(async (file) => {
-          return new Promise((resolve, reject) => {
-            const reader = new FileReader();
-            reader.onload = (e) => {
-              const buffer = e.target.result;
-              const data = Array.from(new Uint8Array(buffer));
-              resolve({ title: file.name, data });
-            };
-            reader.onerror = reject;
-            reader.readAsArrayBuffer(file);
-          });
-        })
-      );
-
-      console.log('[Upload] post_type being sent:', form.postType?.toLowerCase());
-      const res = await fetch(UPLOAD_URL, {
-        method: 'POST',
-        headers: { 'Content-Type': 'text/plain' },
-        body: JSON.stringify({
-          post_type: form.postType?.toLowerCase() || 'event',
-          images: imagesPayload
-        })
-      });
-
-      const result = await res.json();
-      console.log('[Upload] Server response:', result);
-
-      if (result.success && result.links) {
-        const links = result.links.split(',').map(s => s.trim());
-        const newItems = links.map(link => ({
-          id: Math.random().toString(36).slice(2),
-          type: 'link',
-          value: link
-        }));
-
-        const currentValid = items.filter(it => it.value);
-        onItemsChange([...currentValid, ...newItems]);
-        toast.success(`Successfully uploaded ${links.length} image(s)`);
-      } else {
-        const errorMsg = result.error || result.message || 'Upload failed';
-        throw new Error(errorMsg);
-      }
-    } catch (e) {
-      console.error('Upload Error:', e);
-      toast.error(`Upload failed: ${e.message}`);
-    } finally {
-      setUploading(false);
-      if (fileInputRef.current) fileInputRef.current.value = '';
-    }
-  };
-
-  const updateItem = (id, val) => {
-    onItemsChange(items.map(it => it.id === id ? { ...it, value: val } : it));
-  };
-
-  const remove = (id) => {
-    if (disabled) return;
-    const next = items.filter(it => it.id !== id);
-    onItemsChange(next.length ? next : [newRow()]);
-  };
-
-  const addRow = () => {
-    if (items.length >= max) return;
-    onItemsChange([...items, newRow()]);
-  };
-
-  const onDragOver = (e) => {
-    e.preventDefault();
-    e.stopPropagation();
-  };
-
-  const onDrop = (e) => {
-    e.preventDefault();
-    e.stopPropagation();
-    const files = e.dataTransfer.files;
-    if (files && files.length > 0) {
-      handleUpload(files);
-    }
-  };
-
-  const validItems = items.filter(it => it.value);
+  // Close on Escape
+  useEffect(() => {
+    const onKey = (e) => { if (e.key === 'Escape') onClose?.(); };
+    document.addEventListener('keydown', onKey);
+    return () => document.removeEventListener('keydown', onKey);
+  }, [onClose]);
 
   return (
-    <div className="rounded-xl bg-gradient-to-br from-cream-100 to-cream-50 border border-cream-300/60 p-4 space-y-4">
-      <div className="flex items-center justify-between gap-4">
-        <div>
-          <div className="text-[11px] uppercase tracking-[0.16em] text-ink-500 font-semibold">{title}</div>
-          <div className="text-xs text-ink-500 mt-0.5">{hint}</div>
-        </div>
-        <div className="inline-flex p-0.5 bg-cream-100 rounded-lg flex-shrink-0">
-          {/* <TypeBtn active={mode === 'link'} onClick={() => setMode('link')} disabled={disabled}>
-            <LinkIcon /> Copy Link
-          </TypeBtn> */}
-          <TypeBtn active={mode === 'upload'} onClick={() => setMode('upload')} disabled={disabled}>
-            <UploadIcon /> Explore
-          </TypeBtn>
-        </div>
-      </div>
-
-      {mode === 'upload' ? (
-        <div
-          onDragOver={onDragOver}
-          onDrop={onDrop}
-          className={`relative border-2 border-dashed rounded-xl p-8 flex flex-col items-center justify-center transition-all ${uploading ? 'bg-cream-100 border-cream-300 pointer-events-none' : 'bg-white border-cream-300/60 hover:border-brand-300 hover:bg-brand-50/30'
-            }`}
-        >
-          <input
-            type="file"
-            multiple
-            accept="image/*"
-            className="hidden"
-            ref={fileInputRef}
-            onChange={(e) => handleUpload(e.target.files)}
-          />
-
-          {uploading ? (
-            <div className="flex flex-col items-center gap-3">
-              <Spinner className="h-8 w-8 text-brand-600" />
-              <div className="text-sm font-medium text-ink-700">Uploading to Cloud...</div>
-            </div>
-          ) : (
-            <div className="flex flex-col items-center text-center gap-3">
-              <div className="h-12 w-12 rounded-full bg-brand-50 text-brand-600 flex items-center justify-center">
-                <UploadIcon />
-              </div>
-              <div>
-                <div className="text-sm font-bold text-ink-900">Drag & Drop images here</div>
-                <div className="text-xs text-ink-500 mt-1">PNG, JPG, WEBP (Max 5MB each)</div>
-              </div>
-              <button
-                type="button"
-                onClick={() => fileInputRef.current?.click()}
-                className="mt-2 btn-ghost text-brand-700 bg-white border-brand-200 hover:bg-brand-50"
-              >
-                Explore Files
-              </button>
-            </div>
-          )}
-        </div>
-      ) : (
-        <div className="space-y-3">
-          {items.map((item, i) => (
-            <LinkRow
-              key={item.id}
-              index={i + 1}
-              value={item.value}
-              onUpdate={(v) => updateItem(item.id, v)}
-              onRemove={() => remove(item.id)}
-              canRemove={items.length > 1}
-              disabled={disabled}
-            />
-          ))}
-          {items.length < max && (
-            <button
-              type="button"
-              onClick={addRow}
-              disabled={disabled}
-              className="inline-flex items-center gap-2 rounded-lg border border-dashed border-brand-300/70 text-brand-700 px-3 py-2 text-sm font-medium hover:bg-brand-50 transition"
-            >
-              <PlusCircleIcon /> Add Link Row
-            </button>
-          )}
-        </div>
-      )}
-
-      {/* Preview Section */}
-      {validItems.length > 0 && (
-        <div className="grid grid-cols-2 sm:grid-cols-3 md:grid-cols-5 gap-3 pt-2">
-          {validItems.map((item) => (
-            <div key={item.id} className="group relative aspect-square rounded-lg border border-cream-300/60 bg-white overflow-hidden shadow-sm animate-fade-in">
-              <img
-                src={item.value}
-                className="h-full w-full object-cover"
-                alt="Uploaded"
-                referrerPolicy="no-referrer"
-                crossOrigin="anonymous"
-                onError={(e) => { e.target.src = ''; e.target.alt = 'Preview unavailable'; }}
-              />
-              <button
-                type="button"
-                onClick={() => remove(item.id)}
-                className="absolute top-1 right-1 h-6 w-6 rounded-full bg-black/50 text-white flex items-center justify-center opacity-0 group-hover:opacity-100 transition-opacity hover:bg-red-500"
-              >
-                <XIcon />
-              </button>
-            </div>
-          ))}
-        </div>
-      )}
-
-      <div className="flex items-center justify-between pt-1">
-        <div className={`text-xs inline-flex items-center gap-1.5 transition-colors ${valid ? 'text-accent-green' : 'text-accent-amber'}`}>
-          <span className={`h-1.5 w-1.5 rounded-full ${valid ? 'bg-accent-green' : 'bg-accent-amber animate-pulse-soft'}`} />
-          {validHint}
-        </div>
-      </div>
-
-      <div className="border-t border-cream-300/60 pt-3">
-        <Field label="Personal Touch (optional)">
-          <textarea
-            rows={2}
-            value={form.imagePrompt}
-            onChange={set('imagePrompt')}
-            disabled={disabled}
-            placeholder="Cropping, mood, branding…"
-            className="input text-sm"
-          />
-        </Field>
-      </div>
-    </div>
-  );
-}
-
-function LinkRow({ index, value, onUpdate, onRemove, canRemove, disabled }) {
-  return (
-    <div className="rounded-xl border border-cream-300/60 bg-white p-3 transition-all hover:border-brand-200 animate-fade-in text-ink-900 group">
-      <div className="flex items-center justify-between mb-2">
-        <div className="text-[11px] uppercase tracking-[0.14em] text-ink-500 font-semibold">
-          Image {index}
-        </div>
-        {canRemove && (
+    <div
+      className="fixed inset-0 z-50 bg-ink-900/55 backdrop-blur-sm flex items-start justify-center p-4 sm:p-8 overflow-y-auto animate-fade-in"
+      onClick={onClose}
+    >
+      <div
+        className="bg-white rounded-2xl shadow-2xl w-full max-w-xl border border-cream-200 animate-fade-up"
+        onClick={(e) => e.stopPropagation()}
+      >
+        <header className="px-5 py-4 flex items-center justify-between gap-3 border-b border-cream-200 sticky top-0 bg-white rounded-t-2xl">
+          <h3 className="h-display text-lg text-ink-900">
+            {meta?.label || 'Preview'}
+          </h3>
           <button
             type="button"
-            onClick={onRemove}
-            disabled={disabled}
-            className="rounded-md p-1.5 text-ink-500 hover:text-brand-700 hover:bg-brand-50 transition"
+            onClick={onClose}
+            className="h-9 w-9 rounded-full bg-cream-100 hover:bg-cream-200 text-ink-700 flex items-center justify-center transition-all"
+            aria-label="Close preview"
           >
-            <XIcon />
+            <svg viewBox="0 0 24 24" className="h-4 w-4" fill="none" stroke="currentColor" strokeWidth="2.5">
+              <path d="M6 6l12 12M6 18L18 6" strokeLinecap="round" />
+            </svg>
+          </button>
+        </header>
+        <div className="p-4">
+          <PreviewSwitcher
+            platform={platform}
+            caption={caption}
+            images={images}
+            eventName={eventName}
+          />
+        </div>
+      </div>
+    </div>
+  );
+}
+
+function GeneratingOverlay({ elapsed, remaining, estimated, pct, status, onClose }) {
+  // Lock the body scroll so the page can't scroll behind the overlay; restore on unmount.
+  useEffect(() => {
+    const prev = document.body.style.overflow;
+    document.body.style.overflow = 'hidden';
+    return () => { document.body.style.overflow = prev; };
+  }, []);
+
+  // Cap the elapsed display at the estimated time so we never show "1m 30s elapsed / 0s remaining" —
+  // once we cross the expected window, switch to a "taking longer than expected" mode.
+  const overran = elapsed >= estimated;
+  const displayElapsed = Math.min(elapsed, estimated);
+
+  return (
+    <div className="fixed inset-0 z-50 bg-ink-900/55 backdrop-blur-sm overflow-y-auto animate-fade-in">
+      <div className="min-h-screen flex items-center justify-center p-4">
+        <div className="relative bg-white rounded-3xl shadow-2xl p-7 max-w-md w-full text-center border border-cream-200 my-4">
+
+        {/* Manual close (X) — always visible so the user can dismiss anytime */}
+        {onClose && (
+          <button
+            type="button"
+            onClick={onClose}
+            title="Close — generation continues in the background"
+            className="absolute top-3 right-3 h-9 w-9 rounded-full bg-cream-100 hover:bg-cream-200 text-ink-700 flex items-center justify-center transition-all"
+          >
+            <svg viewBox="0 0 24 24" className="h-4 w-4" fill="none" stroke="currentColor" strokeWidth="2.5">
+              <path d="M6 6l12 12M6 18L18 6" strokeLinecap="round" />
+            </svg>
+          </button>
+        )}
+
+        <div className="h-20 w-20 rounded-full bg-brand-gradient mx-auto flex items-center justify-center mb-5 shadow-glow">
+          <Spinner className="h-8 w-8 text-white" />
+        </div>
+
+        <h2 className="h-display text-2xl text-ink-900">
+          {overran ? 'Taking a little longer…' : 'Forging your content'}
+        </h2>
+        <p className="text-sm text-ink-600 mt-2">
+          {overran
+            ? 'The workflow is still running. You can close this and check back — the post will appear in your list once ready.'
+            : `Generating image and per-platform captions. Usually completes in ~${estimated} seconds.`}
+        </p>
+
+        {/* Progress bar — caps at 100% */}
+        <div className="mt-6 h-2.5 rounded-full bg-cream-200 overflow-hidden">
+          <div
+            className={`h-full rounded-full transition-[width] duration-500 ease-snap ${overran ? 'bg-accent-amber' : 'bg-brand-gradient'}`}
+            style={{ width: `${pct}%` }}
+          />
+        </div>
+
+        {/* Elapsed / remaining — capped at estimated so we don't show negative numbers */}
+        <div className="mt-3 flex items-center justify-between text-xs text-ink-700 tabular-nums">
+          <span><strong className="text-ink-900">{displayElapsed}s</strong> elapsed</span>
+          <span>
+            {overran
+              ? <strong className="text-accent-amber">Past expected window</strong>
+              : <>~<strong className="text-ink-900">{remaining}s</strong> remaining</>
+            }
+          </span>
+        </div>
+
+        {/* Live step label */}
+        {status && (
+          <div className="mt-5 inline-flex items-center gap-2 rounded-full bg-cream-100 px-4 py-2 text-xs font-semibold text-ink-700">
+            <span className="h-1.5 w-1.5 rounded-full bg-brand-600 animate-pulse-soft" />
+            {status}
+          </div>
+        )}
+
+        <p className="text-[11px] text-ink-500 mt-5">
+          {overran
+            ? 'It is safe to close this — the workflow keeps running on n8n and Supabase will update when finished.'
+            : 'The page will update automatically as soon as Supabase reflects the new data — leave this open.'}
+        </p>
+
+        {/* Close button appears as a regular CTA once we are past the expected window */}
+        {overran && onClose && (
+          <button
+            type="button"
+            onClick={onClose}
+            className="mt-5 w-full btn-ghost text-xs px-3 py-2 inline-flex items-center justify-center gap-1.5 hover:border-brand-300 hover:text-brand-700"
+          >
+            Close and continue in background
+          </button>
+        )}
+        </div>
+      </div>
+    </div>
+  );
+}
+
+function ImageLinksUploader({ images = [], onChange, max = 5, disabled = false }) {
+  const inputRef = React.useRef(null);
+  const [drag, setDrag] = React.useState(false);
+
+  // Track latest images via ref so async upload callbacks see fresh state.
+  // onChange always receives an array (functional form is resolved here).
+  const imagesRef = React.useRef(images);
+  React.useEffect(() => { imagesRef.current = images; }, [images]);
+
+  const update = (fn) => {
+    const next = fn(imagesRef.current);
+    imagesRef.current = next;
+    onChange?.(next);
+  };
+
+  const startUpload = (item) => {
+    import('../services/imagekit.js').then(({ uploadToImageKit }) => {
+      uploadToImageKit(item.file, { folder: '/Post_Images' })
+        .then((cdnUrl) => {
+          update((current) => current.map(it => {
+            if (it.id !== item.id) return it;
+            if (it.url?.startsWith('blob:')) URL.revokeObjectURL(it.url);
+            return { ...it, url: cdnUrl, status: 'ready', file: null };
+          }));
+        })
+        .catch((err) => {
+          console.error('[upload]', err);
+          update((current) => current.map(it =>
+            it.id === item.id ? { ...it, status: 'failed', error: err.message || 'Upload failed' } : it
+          ));
+        });
+    });
+  };
+
+  const addFiles = (fileList) => {
+    if (disabled) return;
+    const files = Array.from(fileList || []).filter(f => f.type.startsWith('image/'));
+    if (files.length === 0) return;
+    const room = max - imagesRef.current.length;
+    if (room <= 0) return;
+    const newItems = files.slice(0, room).map(file => ({
+      id: `${Date.now()}-${Math.random().toString(36).slice(2, 7)}`,
+      url: URL.createObjectURL(file),
+      name: file.name,
+      file,
+      status: 'uploading'
+    }));
+    update((current) => [...current, ...newItems]);
+    newItems.forEach(startUpload);
+  };
+
+  const retryUpload = (id) => {
+    const target = imagesRef.current.find(i => i.id === id);
+    if (!target?.file) return;
+    update((current) => current.map(it =>
+      it.id === id ? { ...it, status: 'uploading', error: null } : it
+    ));
+    startUpload(target);
+  };
+
+  const removeAt = (id) => {
+    if (disabled) return;
+    update((current) => {
+      const removed = current.find(i => i.id === id);
+      if (removed?.url?.startsWith('blob:')) URL.revokeObjectURL(removed.url);
+      return current.filter(i => i.id !== id);
+    });
+  };
+
+  const count = images.length;
+  const atMax = count >= max;
+  const uploading = images.filter(i => i.status === 'uploading').length;
+  const failed    = images.filter(i => i.status === 'failed').length;
+  const ready     = images.filter(i => i.status === 'ready' || !i.status).length; // legacy items without status treated as ready
+  const valid = ready >= 1 && uploading === 0 && failed === 0;
+
+  const onPick = () => { if (!disabled && !atMax) inputRef.current?.click(); };
+  const onInput = (e) => { addFiles(e.target.files); e.target.value = ''; };
+  const onDrop = (e) => { e.preventDefault(); e.stopPropagation(); setDrag(false); addFiles(e.dataTransfer.files); };
+  const onDragOver = (e) => { e.preventDefault(); e.stopPropagation(); if (!drag) setDrag(true); };
+  const onDragLeave = (e) => { e.preventDefault(); e.stopPropagation(); setDrag(false); };
+
+  return (
+    <div className="mt-5 rounded-xl bg-gradient-to-br from-cream-100 to-cream-50 border border-cream-300/60 p-5">
+      <div className="flex items-start justify-between gap-3 mb-4">
+        <div>
+          <div className="text-[11px] uppercase tracking-[0.18em] text-ink-500 font-bold">Image Links</div>
+          <div className="text-xs text-ink-500 mt-1">Add 1 or more images (max {max})</div>
+        </div>
+        <button
+          onClick={onPick}
+          disabled={disabled || atMax}
+          className="btn-ghost inline-flex items-center gap-2 text-xs uppercase tracking-wider font-bold border-cream-300 hover:bg-white disabled:opacity-50 disabled:cursor-not-allowed"
+        >
+          <UploadIcon /> Explore
+        </button>
+      </div>
+
+      <input
+        ref={inputRef}
+        type="file"
+        accept="image/png,image/jpeg,image/jpg,image/webp"
+        multiple
+        className="hidden"
+        onChange={onInput}
+      />
+
+      <div
+        onClick={onPick}
+        onDrop={onDrop}
+        onDragOver={onDragOver}
+        onDragLeave={onDragLeave}
+        className={[
+          'relative border-2 border-dashed rounded-xl p-8 lg:p-10 flex flex-col items-center justify-center gap-3 text-center transition-all',
+          disabled
+            ? 'border-cream-300 bg-cream-100/50 cursor-not-allowed'
+            : atMax
+              ? 'border-cream-300 bg-cream-100/60 cursor-not-allowed'
+              : drag
+                ? 'border-brand-500 bg-brand-50 cursor-pointer'
+                : 'border-cream-300 bg-white/70 hover:border-brand-300 hover:bg-brand-50/30 cursor-pointer'
+        ].join(' ')}
+      >
+        <div className="h-12 w-12 rounded-full bg-brand-50 text-brand-600 flex items-center justify-center">
+          <UploadIcon className="h-5 w-5" />
+        </div>
+        <div className="font-bold text-ink-900">
+          {atMax ? `Maximum ${max} images reached` : 'Drag & Drop images here'}
+        </div>
+        <div className="text-xs text-ink-500">PNG, JPG, WEBP (Max 5MB each)</div>
+        {!atMax && (
+          <button
+            type="button"
+            onClick={(e) => { e.stopPropagation(); onPick(); }}
+            disabled={disabled}
+            className="mt-1 btn-ghost text-brand-700 bg-white border-brand-200 hover:bg-brand-50 inline-flex items-center gap-2"
+          >
+            Explore Files
           </button>
         )}
       </div>
-      <div className="relative">
-        <span className="absolute left-3 top-1/2 -translate-y-1/2 text-ink-500">
-          <LinkIcon />
+
+      {/* Validation chip */}
+      <div className="mt-3 flex items-center justify-between flex-wrap gap-2">
+        <div className={`text-xs inline-flex items-center gap-1.5 font-medium ${valid ? 'text-accent-green' : (uploading > 0 ? 'text-accent-blue' : (failed > 0 ? 'text-brand-700' : 'text-accent-amber'))}`}>
+          <span className={`h-1.5 w-1.5 rounded-full ${valid ? 'bg-accent-green' : (uploading > 0 ? 'bg-accent-blue animate-pulse-soft' : (failed > 0 ? 'bg-brand-700' : 'bg-accent-amber animate-pulse-soft'))}`} />
+          {count === 0
+            ? 'Need at least 1 image'
+            : uploading > 0
+              ? `Uploading ${uploading} image${uploading === 1 ? '' : 's'}…`
+              : failed > 0
+                ? `${failed} upload${failed === 1 ? '' : 's'} failed — retry or remove`
+                : `${ready} of ${max} image${ready === 1 ? '' : 's'} ready`}
+        </div>
+      </div>
+
+      {/* Thumbnail grid */}
+      {images.length > 0 && (
+        <div className="mt-4 grid grid-cols-3 sm:grid-cols-5 gap-3">
+          {images.map((img) => {
+            const isUploading = img.status === 'uploading';
+            const isFailed    = img.status === 'failed';
+            return (
+              <div key={img.id} className="group relative aspect-square rounded-lg border border-cream-300/60 bg-white overflow-hidden shadow-sm animate-fade-in">
+                <img
+                  src={img.url}
+                  alt={img.name || ''}
+                  referrerPolicy="no-referrer"
+                  className={`h-full w-full object-cover ${isUploading ? 'opacity-50' : ''}`}
+                  onError={(e) => { e.target.style.opacity = 0.3; }}
+                />
+
+                {/* Uploading overlay */}
+                {isUploading && (
+                  <div className="absolute inset-0 bg-black/30 flex flex-col items-center justify-center gap-1 text-white">
+                    <Spinner className="h-5 w-5" />
+                    <span className="text-[9px] font-bold uppercase tracking-wider">Uploading…</span>
+                  </div>
+                )}
+
+                {/* Failed overlay */}
+                {isFailed && (
+                  <div className="absolute inset-0 bg-red-900/55 flex flex-col items-center justify-center gap-1 text-white px-2 text-center">
+                    <svg viewBox="0 0 24 24" className="h-5 w-5" fill="none" stroke="currentColor" strokeWidth="2">
+                      <circle cx="12" cy="12" r="9" /><path d="M12 8v5M12 16h0" strokeLinecap="round" />
+                    </svg>
+                    <span className="text-[9px] font-bold uppercase tracking-wider">Upload failed</span>
+                    <button
+                      type="button"
+                      onClick={() => retryUpload(img.id)}
+                      className="mt-0.5 text-[10px] uppercase tracking-wider font-bold underline hover:no-underline"
+                    >
+                      Retry
+                    </button>
+                  </div>
+                )}
+
+                {/* Ready check */}
+                {!isUploading && !isFailed && (
+                  <span className="absolute bottom-1 left-1 h-5 w-5 rounded-full bg-accent-green/95 text-white flex items-center justify-center shadow">
+                    <svg viewBox="0 0 24 24" className="h-3 w-3" fill="none" stroke="currentColor" strokeWidth="3">
+                      <path d="M5 13l4 4 10-10" strokeLinecap="round" strokeLinejoin="round" />
+                    </svg>
+                  </span>
+                )}
+
+                {/* Remove */}
+                {!disabled && (
+                  <button
+                    type="button"
+                    onClick={() => removeAt(img.id)}
+                    className="absolute top-1 right-1 h-6 w-6 rounded-full bg-black/55 text-white flex items-center justify-center opacity-0 group-hover:opacity-100 hover:bg-red-500 transition-opacity"
+                    title="Remove"
+                  >
+                    <svg viewBox="0 0 24 24" className="h-3.5 w-3.5" fill="none" stroke="currentColor" strokeWidth="2.5">
+                      <path d="M6 6l12 12M6 18L18 6" strokeLinecap="round" />
+                    </svg>
+                  </button>
+                )}
+              </div>
+            );
+          })}
+        </div>
+      )}
+    </div>
+  );
+}
+
+function PlatformChipStrip({ platforms, campaign }) {
+  return (
+    <div className="flex items-center gap-1.5 overflow-x-auto scrollbar-none">
+      {platforms.map(pid => {
+        const meta = PLATFORM_META[pid];
+        const status = campaign ? campaign[`${pid}_published_status`] : null;
+        return (
+          <span
+            key={pid}
+            style={{ background: meta.color, color: '#fff', borderColor: meta.color }}
+            className="rounded-full px-3.5 py-2 text-sm font-semibold inline-flex items-center gap-2 border shrink-0 shadow-soft"
+          >
+            <PlatformGlyph platform={pid} className="h-4 w-4" />
+            {meta.label}
+            {status && status !== 'draft' && (
+              <span className={[
+                'h-1.5 w-1.5 rounded-full',
+                status === 'posted' ? 'bg-white'
+                  : status === 'scheduled' ? 'bg-white/80'
+                  : status === 'failed' ? 'bg-red-300'
+                  : 'bg-white/60'
+              ].join(' ')} />
+            )}
+          </span>
+        );
+      })}
+    </div>
+  );
+}
+
+function PlatformGlyph({ platform, className = 'h-4 w-4' }) {
+  switch (platform) {
+    case 'instagram': return <svg viewBox="0 0 24 24" className={className} fill="none" stroke="currentColor" strokeWidth="2"><rect x="3" y="3" width="18" height="18" rx="5" /><circle cx="12" cy="12" r="4" /><circle cx="17.5" cy="6.5" r="1" fill="currentColor" /></svg>;
+    case 'x':         return <svg viewBox="0 0 24 24" className={className} fill="currentColor"><path d="M18.244 2H21l-6.51 7.44L22 22h-6.74l-4.7-6.13L4.96 22H2.2l6.97-7.96L2 2h6.91l4.26 5.62L18.244 2z" /></svg>;
+    case 'linkedin':  return <svg viewBox="0 0 24 24" className={className} fill="currentColor"><path d="M19 3a2 2 0 0 1 2 2v14a2 2 0 0 1-2 2H5a2 2 0 0 1-2-2V5a2 2 0 0 1 2-2h14zM8.4 17V10H6v7h2.4zM7.2 9a1.4 1.4 0 1 0 0-2.8 1.4 1.4 0 0 0 0 2.8zM18 17v-3.86c0-2.07-1.12-3.04-2.6-3.04-1.21 0-1.75.66-2.05 1.13V10H11v7h2.35v-3.79c0-.96.18-1.89 1.37-1.89s1.28 1.08 1.28 1.95V17H18z" /></svg>;
+    case 'fb':        return <svg viewBox="0 0 24 24" className={className} fill="currentColor"><path d="M22 12a10 10 0 1 0-11.56 9.88V14.9H7.9V12h2.54V9.8c0-2.52 1.5-3.9 3.78-3.9 1.1 0 2.24.2 2.24.2v2.46h-1.26c-1.24 0-1.63.77-1.63 1.56V12h2.77l-.44 2.9h-2.33v6.98A10 10 0 0 0 22 12z" /></svg>;
+    default: return null;
+  }
+}
+
+function PostTypeIcon({ type }) {
+  if (type === 'observance') return <svg viewBox="0 0 24 24" className="h-4 w-4" fill="none" stroke="currentColor" strokeWidth="2"><path d="M12 3l2 5 5 2-5 2-2 5-2-5-5-2 5-2 2-5z" strokeLinejoin="round" /></svg>;
+  if (type === 'event')      return <svg viewBox="0 0 24 24" className="h-4 w-4" fill="none" stroke="currentColor" strokeWidth="2"><rect x="3" y="5" width="18" height="16" rx="2" /><path d="M3 10h18M8 3v4M16 3v4" strokeLinecap="round" /></svg>;
+  return <svg viewBox="0 0 24 24" className="h-4 w-4" fill="none" stroke="currentColor" strokeWidth="2"><rect x="3" y="3" width="8" height="8" rx="1.5" /><rect x="13" y="3" width="8" height="8" rx="1.5" /><rect x="3" y="13" width="8" height="8" rx="1.5" /><rect x="13" y="13" width="8" height="8" rx="1.5" /></svg>;
+}
+
+function PlatformCaptionCard({
+  platform, campaign, form, setForm,
+  editingPlatform, setEditingPlatform, draftEdit, setDraftEdit,
+  busy,
+  onRegenerate, onSaveEdit, onApprove,
+  approvalDirty
+}) {
+  const meta = PLATFORM_META[platform];
+  const caption = campaign?.[`${platform}_caption`] || '';
+  const approval = campaign?.[`${platform}_approval_status`] || 'draft';
+  const published = campaign?.[`${platform}_published_status`] || 'draft';
+  const scheduledAt = campaign?.[`${platform}_scheduled_at`] || null;
+  const postedAt = campaign?.[`${platform}_posted_at`] || null;
+  const postUrl = campaign?.[`${platform}_post_url`] || null;
+
+  const override = form.captionOverrides[platform];
+  const shown = override ?? caption;
+  const isEdit = editingPlatform === platform;
+  const alreadyPosted = published === 'posted';
+
+  const startEdit = () => { setDraftEdit(shown || ''); setEditingPlatform(platform); };
+  const cancelEdit = () => setEditingPlatform(null);
+  const saveEdit = async () => {
+    setForm(f => ({ ...f, captionOverrides: { ...f.captionOverrides, [platform]: draftEdit } }));
+    setEditingPlatform(null);
+    await onSaveEdit?.(draftEdit, platform);
+  };
+  const revertOverride = () => {
+    setForm(f => {
+      const next = { ...f.captionOverrides };
+      delete next[platform];
+      return { ...f, captionOverrides: next };
+    });
+  };
+
+  const tagBusy = (kind) => busy === `${kind}-${platform}`;
+
+  return (
+    <div className="rounded-xl border bg-white" style={{ borderColor: `${meta.color}55` }}>
+      {/* Header */}
+      <div className="px-4 py-3 flex items-center gap-2 border-b border-cream-200">
+        <span className="h-7 w-7 rounded-lg flex items-center justify-center text-white shrink-0" style={{ background: meta.color }}>
+          <PlatformGlyph platform={platform} className="h-4 w-4" />
         </span>
-        <input
-          value={value}
-          onChange={(event) => onUpdate(event.target.value)}
-          disabled={disabled}
-          placeholder="https://example.com/image.jpg"
-          className="input text-sm"
-          style={{ paddingLeft: '2.75rem' }}
-        />
+        <div className="font-bold text-ink-900 text-sm">{meta.label}</div>
+        {override !== undefined && (
+          <span className="text-[9px] uppercase tracking-wider font-bold text-brand-700 bg-brand-50 ring-1 ring-brand-200 rounded-full px-2 py-0.5">
+            Edited
+          </span>
+        )}
+      </div>
+
+      {/* Body */}
+      <div className="p-4">
+        {isEdit ? (
+          <>
+            <textarea
+              rows={5}
+              value={draftEdit}
+              onChange={(e) => setDraftEdit(e.target.value)}
+              className="input text-sm"
+              placeholder={`Write a ${meta.label} caption…`}
+              autoFocus
+            />
+            <div className="mt-2 flex items-center justify-between gap-2">
+              <span className="text-[11px] text-ink-500">
+                {draftEdit.trim().length} chars
+                {platform === 'x' && draftEdit.length > 280 && (
+                  <span className="text-red-600 font-semibold ml-2">over 280-char limit</span>
+                )}
+              </span>
+              <div className="flex items-center gap-2">
+                <button onClick={cancelEdit} className="btn-ghost text-xs px-3 py-1.5">Cancel</button>
+                <button onClick={saveEdit} className="btn-primary text-xs px-3 py-1.5 inline-flex items-center gap-1.5">
+                  <SaveIcon /> Save edit
+                </button>
+              </div>
+            </div>
+          </>
+        ) : (
+          <>
+            <div className="text-sm text-ink-900 whitespace-pre-wrap min-h-[48px]">
+              {shown || <span className="text-ink-400 italic">Caption will appear here after generation.</span>}
+            </div>
+
+            {!alreadyPosted && (
+              <div className="mt-3 pt-3 border-t border-cream-200 flex flex-wrap items-center gap-2 justify-between">
+                <div className="flex flex-wrap items-center gap-2">
+                  <button
+                    onClick={() => onRegenerate?.(platform)}
+                    disabled={tagBusy('caption')}
+                    className="btn-ghost text-xs px-3 py-1.5 inline-flex items-center gap-1.5 hover:border-brand-300 hover:text-brand-700 disabled:opacity-50"
+                  >
+                    {tagBusy('caption') ? <Spinner /> : <RegenIcon />} Regenerate
+                  </button>
+                  <button onClick={startEdit} className="btn-ghost text-xs px-3 py-1.5 inline-flex items-center gap-1.5 hover:border-brand-300 hover:text-brand-700">
+                    <PencilIcon /> Edit
+                  </button>
+                  {override !== undefined && (
+                    <button onClick={revertOverride} className="text-[11px] uppercase tracking-wider font-bold text-ink-500 hover:text-brand-700">
+                      Revert to AI
+                    </button>
+                  )}
+                </div>
+                {/* Accept is always visible but only clickable after the caption has been
+                    changed (regenerated or manually edited) in this session. Untouched drafts
+                    are treated as already accepted — the button shows "Accepted" + disabled
+                    so the user can see the state without being able to re-click it. */}
+                <button
+                  onClick={() => onApprove?.(platform)}
+                  disabled={!approvalDirty || tagBusy('approve')}
+                  title={approvalDirty ? 'Accept the updated caption' : 'Already accepted — regenerate or edit to change'}
+                  className="btn-ghost text-xs px-3 py-1.5 inline-flex items-center gap-1.5 text-accent-green border-green-200 hover:bg-green-50 disabled:opacity-40 disabled:cursor-not-allowed disabled:hover:bg-transparent"
+                >
+                  {tagBusy('approve') ? <Spinner /> : <ApproveIcon />}
+                  {approvalDirty ? 'Accept' : 'Accepted'}
+                </button>
+              </div>
+            )}
+
+            {(postedAt || scheduledAt) && (
+              <div className="mt-3 pt-3 border-t border-cream-200 text-xs text-ink-500 flex items-center justify-between flex-wrap gap-2">
+                <div>
+                  {postedAt && <>Posted <span className="text-ink-900 font-semibold">{new Date(postedAt).toLocaleString()}</span></>}
+                  {!postedAt && scheduledAt && <>Scheduled <span className="text-ink-900 font-semibold">{new Date(scheduledAt).toLocaleString()}</span></>}
+                </div>
+                {postUrl && (
+                  <a href={postUrl} target="_blank" rel="noreferrer" className="text-brand-700 font-semibold hover:underline">View post →</a>
+                )}
+              </div>
+            )}
+          </>
+        )}
       </div>
     </div>
   );
 }
 
-function TypeBtn({ active, onClick, children, disabled }) {
+function Section({ title, subtitle, tint, accent, children }) {
   return (
-    <button
-      type="button"
-      onClick={onClick}
-      disabled={disabled}
-      className={[
-        'inline-flex items-center gap-1.5 rounded-md px-2.5 py-1 text-[11px] font-semibold uppercase tracking-wider transition-all duration-200',
-        active
-          ? 'bg-white text-brand-700 shadow-soft'
-          : 'text-ink-600 hover:text-ink-900'
-      ].join(' ')}
-    >
-      {children}
-    </button>
-  );
-}
-
-const PlusCircleIcon = () => (
-  <svg viewBox="0 0 24 24" className="h-4 w-4" fill="none" stroke="currentColor" strokeWidth="2">
-    <circle cx="12" cy="12" r="9" /><path d="M12 8v8M8 12h8" strokeLinecap="round" />
-  </svg>
-);
-const LinkIcon = () => (
-  <svg viewBox="0 0 24 24" className="h-3.5 w-3.5" fill="none" stroke="currentColor" strokeWidth="2">
-    <path d="M10 14a5 5 0 0 0 7 0l3-3a5 5 0 0 0-7-7l-1 1M14 10a5 5 0 0 0-7 0l-3 3a5 5 0 0 0 7 7l1-1" strokeLinecap="round" strokeLinejoin="round" />
-  </svg>
-);
-const DriveIcon = () => (
-  <svg viewBox="0 0 24 24" className="h-3.5 w-3.5" fill="currentColor">
-    <path d="M7.71 3.5L1.15 15l3.42 6L11 9.5 7.71 3.5zM22.85 15l-6.56-11.5h-6.84L16 15h6.85zM5.43 22.5h13.14L22 16.5H8.86l-3.43 6z" />
-  </svg>
-);
-const XIcon = () => (
-  <svg viewBox="0 0 24 24" className="h-4 w-4" fill="none" stroke="currentColor" strokeWidth="2">
-    <path d="M6 6l12 12M6 18L18 6" strokeLinecap="round" />
-  </svg>
-);
-
-function GeneratingTile() {
-  return (
-    <div className="absolute inset-0 flex flex-col items-center justify-center text-ink-700 gap-3 bg-gradient-to-br from-cream-100 to-brand-50">
-      <div className="absolute inset-0 shimmer opacity-60" />
-      <div className="relative flex flex-col items-center gap-3 animate-fade-in">
-        <div className="h-12 w-12 rounded-full bg-gradient-to-br from-brand-500 to-brand-700 text-white flex items-center justify-center animate-breathe shadow-glow">
-          <svg viewBox="0 0 24 24" className="h-6 w-6 animate-spin-slow" fill="none" stroke="currentColor" strokeWidth="2">
-            <path d="M12 3l2 5 5 2-5 2-2 5-2-5-5-2 5-2 2-5z" strokeLinejoin="round" />
-          </svg>
-        </div>
-        <div className="font-medium text-ink-900">Generating visual…</div>
-        <div className="text-xs text-ink-500">Workflow is running</div>
-        <div className="h-1 w-32 bg-cream-200 rounded-full overflow-hidden">
-          <div className="h-full bg-brand-600 origin-left animate-progress-indet" />
-        </div>
-      </div>
-    </div>
-  );
-}
-
-/* ----- shared ----- */
-
-function Section({ title, children }) {
-  return (
-    <section className="card card-hover p-6">
+    <section className={`card p-6 ${tint ? 'bg-gradient-to-br from-brand-50/40 to-cream-50' : ''}`}
+      style={accent ? { borderColor: `${accent}33` } : {}}>
       <div className="mb-4">
-        <h2 className="h-display text-xl text-ink-900">{title}</h2>
+        <div className="text-[11px] uppercase tracking-[0.18em] text-ink-500 font-bold">{title}</div>
+        {subtitle && <div className="text-xs text-ink-500 mt-1 normal-case tracking-normal font-normal">{subtitle}</div>}
       </div>
       {children}
     </section>
@@ -1031,34 +1526,16 @@ function Field({ label, hint, children, className = '' }) {
   );
 }
 
-function Pill({ children }) {
-  return (
-    <span className="rounded-full bg-cream-100 border border-cream-300/60 px-2 py-0.5 text-[11px] text-ink-700">
-      {children}
-    </span>
-  );
-}
+function cap(s) { return s ? s.charAt(0).toUpperCase() + s.slice(1) : s; }
 
-function PostTypeIcon({ type }) {
-  if (type === 'Observance') return (
-    <svg viewBox="0 0 24 24" className="h-4 w-4" fill="none" stroke="currentColor" strokeWidth="2">
-      <path d="M12 3l2 5 5 2-5 2-2 5-2-5-5-2 5-2 2-5z" strokeLinejoin="round" />
-    </svg>
-  );
-  if (type === 'Event') return (
-    <svg viewBox="0 0 24 24" className="h-4 w-4" fill="none" stroke="currentColor" strokeWidth="2">
-      <rect x="3" y="5" width="18" height="16" rx="2" />
-      <path d="M3 10h18M8 3v4M16 3v4" strokeLinecap="round" />
-    </svg>
-  );
-  return (
-    <svg viewBox="0 0 24 24" className="h-4 w-4" fill="none" stroke="currentColor" strokeWidth="2">
-      <rect x="3" y="3" width="8" height="8" rx="1.5" />
-      <rect x="13" y="3" width="8" height="8" rx="1.5" />
-      <rect x="3" y="13" width="8" height="8" rx="1.5" />
-      <rect x="13" y="13" width="8" height="8" rx="1.5" />
-    </svg>
-  );
+function captionPromptPlaceholder(platform) {
+  switch (platform) {
+    case 'instagram': return 'lots of emojis, 5–10 hashtags, visual-first hook';
+    case 'x':         return 'punchy, ≤280 chars, 1 hashtag max, strong line-1 hook';
+    case 'linkedin':  return 'professional, story-driven, line breaks, 100–200 words';
+    case 'fb':        return 'conversational, prompt a comment, medium length';
+    default:          return 'tone, hashtags, mentions, voice';
+  }
 }
 
 const SparkleIcon = () => (
@@ -1076,210 +1553,43 @@ const ClockIcon = () => (
     <circle cx="12" cy="12" r="9" /><path d="M12 7v5l3 2" strokeLinecap="round" />
   </svg>
 );
-const UploadIcon = () => (
-  <svg viewBox="0 0 24 24" className="h-5 w-5" fill="none" stroke="currentColor" strokeWidth="2">
+const RefreshIcon = () => (
+  <svg viewBox="0 0 24 24" className="h-4 w-4" fill="none" stroke="currentColor" strokeWidth="2">
+    <path d="M3 12a9 9 0 0 1 15.5-6.3L21 8M21 3v5h-5M21 12a9 9 0 0 1-15.5 6.3L3 16M3 21v-5h5" strokeLinecap="round" strokeLinejoin="round" />
+  </svg>
+);
+const UploadIcon = ({ className = 'h-4 w-4' }) => (
+  <svg viewBox="0 0 24 24" className={className} fill="none" stroke="currentColor" strokeWidth="2">
     <path d="M21 15v4a2 2 0 0 1-2 2H5a2 2 0 0 1-2-2v-4M17 8l-5-5-5 5M12 3v12" strokeLinecap="round" strokeLinejoin="round" />
   </svg>
 );
-const SaveIcon = () => (
-  <svg viewBox="0 0 24 24" className="h-4 w-4" fill="none" stroke="currentColor" strokeWidth="2">
-    <path d="M5 5v14h14V8l-3-3H5z" /><path d="M8 5v5h7V5M8 14h8v5H8z" />
+const RegenIcon = () => (
+  <svg viewBox="0 0 24 24" className="h-3.5 w-3.5" fill="none" stroke="currentColor" strokeWidth="2">
+    <path d="M3 12a9 9 0 0 1 15.5-6.3L21 8M21 3v5h-5M21 12a9 9 0 0 1-15.5 6.3L3 16M3 21v-5h5" strokeLinecap="round" strokeLinejoin="round" />
   </svg>
 );
-
-function PreviewButton({ onClick }) {
-  return (
-    <button onClick={onClick} className="flex items-center gap-2 text-brand-700 font-medium text-sm hover:text-brand-800">
-      <SparkleIcon /> Preview Post
-    </button>
-  );
-}
-
-function LinkedInModal({ onClose, caption, images, eventName }) {
-  useEffect(() => {
-    const originalStyle = window.getComputedStyle(document.body).overflow;
-    document.body.style.overflow = 'hidden';
-    return () => {
-      document.body.style.overflow = originalStyle;
-    };
-  }, []);
-
-  return (
-    <div className="fixed inset-0 z-[100] flex items-center justify-center p-6 overflow-hidden">
-      <div className="absolute inset-0 bg-ink-900/60 backdrop-blur-sm" onClick={onClose} />
-
-      <div className="relative w-full max-w-[480px] h-full max-h-[85vh] bg-[#f3f2ef] rounded-xl shadow-2xl overflow-hidden animate-zoom-in flex flex-col pointer-events-auto">
-        <div className="flex items-center justify-between px-4 py-3 bg-white border-b border-cream-200 sticky top-0 z-10">
-          <div className="font-bold text-ink-900 text-sm">LinkedIn Preview</div>
-          <button onClick={onClose} className="p-1 hover:bg-cream-100 rounded-full transition-colors text-ink-500">
-            <XIcon />
-          </button>
-        </div>
-
-        <div className="flex-1 overflow-y-auto p-4 custom-scrollbar">
-          <LinkedInPost
-            caption={caption}
-            images={images}
-            eventName={eventName}
-          />
-          <div className="h-4" /> {/* bottom padding */}
-        </div>
-      </div>
-    </div>
-  );
-}
-
-function LinkedInPost({ caption, images = [], eventName, isSidebar = false, generating = false, blurred = false, onClick }) {
-  const [idx, setIdx] = useState(0);
-  const image = images[idx] || null;
-
-  if (isSidebar) {
-    return (
-      <div
-        onClick={onClick}
-        className={`rounded-2xl overflow-hidden bg-white border border-cream-300/60 shadow-soft transition-all duration-700 
-          ${blurred ? 'blur-[2px] grayscale opacity-60' : ''} 
-          ${onClick ? 'cursor-pointer hover:shadow-lg hover:border-brand-200' : ''}`}
-      >
-        <div className="aspect-square bg-cream-200 relative overflow-hidden">
-          {generating ? (
-            <GeneratingTile />
-          ) : image ? (
-            <img
-              key={image}
-              src={image}
-              alt=""
-              className="absolute inset-0 w-full h-full object-cover animate-fade-in"
-              referrerPolicy="no-referrer"
-              crossOrigin="anonymous"
-            />
-          ) : (
-            <div className="absolute inset-0 flex items-center justify-center text-ink-500 text-sm px-6 text-center italic">
-              Preview will be visible after generation
-            </div>
-          )}
-
-          {image && (
-            <>
-              <div className="absolute bottom-0 left-0 right-0 h-20 bg-gradient-to-t from-black/40 to-transparent pointer-events-none" />
-              <div className="absolute bottom-3 left-3 text-white text-xs font-medium tracking-wide">
-                {eventName || 'Untitled'}
-              </div>
-            </>
-          )}
-        </div>
-        <div className="px-4 py-3 flex items-center justify-between text-xs text-ink-500">
-          <span className="uppercase tracking-wider">Preview · Square Aspect</span>
-          <span className="flex items-center gap-1">
-            {[0, 1, 2].map(i => (
-              <span key={i} className={`h-1.5 w-1.5 rounded-full transition-colors ${i === 0 ? 'bg-brand-700' : 'bg-cream-300'}`} />
-            ))}
-          </span>
-        </div>
-      </div>
-    );
-  }
-
-  return (
-    <div className="bg-white rounded-lg shadow-sm border border-black/10 overflow-hidden">
-      {/* Header */}
-      <div className="p-3 flex items-start gap-2">
-        <div className="h-12 w-12 rounded-full overflow-hidden bg-cream-200 shadow-inner flex-shrink-0">
-          <img src="https://ui-avatars.com/api/?name=Admin+GrowwStacks&background=b83a25&color=fff" alt="avatar" />
-        </div>
-        <div className="flex-1 min-w-0">
-          <div className="flex items-center gap-1">
-            <span className="font-bold text-sm text-black hover:text-blue-700 hover:underline cursor-pointer">Admin GrowwStacks</span>
-            <span className="text-xs text-black/60 font-normal">· 1st</span>
-          </div>
-          <div className="text-xs text-black/60 truncate">Content Creator at GrowwStacks</div>
-          <div className="text-[11px] text-black/60 flex items-center gap-1 mt-0.5">
-            <span>Just now</span>
-            <span>·</span>
-            <svg viewBox="0 0 16 16" className="h-3 w-3 inline" fill="currentColor">
-              <path d="M8 1a7 7 0 100 14A7 7 0 008 1zM2.83 8a5.17 5.17 0 1110.34 0 5.17 5.17 0 01-10.34 0z" />
-            </svg>
-          </div>
-        </div>
-        <button className="text-black/60 hover:bg-black/5 p-1 rounded-full">
-          <svg viewBox="0 0 24 24" className="h-6 w-6" fill="currentColor"><path d="M19 12a2 2 0 11-4 0 2 2 0 014 0zM12 12a2 2 0 11-4 0 2 2 0 014 0zM5 12a2 2 0 11-4 0 2 2 0 014 0z" /></svg>
-        </button>
-      </div>
-
-      {/* Post Content */}
-      <div className="px-3 pb-2">
-        <p className="text-sm text-black/90 whitespace-pre-wrap leading-relaxed">
-          {caption}
-        </p>
-      </div>
-
-      {/* Post Image Container */}
-      <div className="bg-cream-100 min-h-[300px] relative group">
-        {image ? (
-          <>
-            <img
-              src={image}
-              alt=""
-              className="w-full h-auto block animate-fade-in"
-              referrerPolicy="no-referrer"
-              crossOrigin="anonymous"
-            />
-            {images.length > 1 && (
-              <>
-                <button
-                  onClick={() => setIdx(p => (p > 0 ? p - 1 : images.length - 1))}
-                  className="absolute left-2 top-1/2 -translate-y-1/2 h-8 w-8 rounded-full bg-black/50 text-white flex items-center justify-center opacity-0 group-hover:opacity-100 transition-opacity"
-                >
-                  <svg viewBox="0 0 24 24" className="h-4 w-4" fill="none" stroke="currentColor" strokeWidth="3"><path d="M15 18l-6-6 6-6" /></svg>
-                </button>
-                <button
-                  onClick={() => setIdx(p => (p < images.length - 1 ? p + 1 : 0))}
-                  className="absolute right-2 top-1/2 -translate-y-1/2 h-8 w-8 rounded-full bg-black/50 text-white flex items-center justify-center opacity-0 group-hover:opacity-100 transition-opacity"
-                >
-                  <svg viewBox="0 0 24 24" className="h-4 w-4" fill="none" stroke="currentColor" strokeWidth="3"><path d="M9 18l6-6-6-6" /></svg>
-                </button>
-                <div className="absolute top-2 right-2 px-2 py-1 bg-black/50 rounded text-[10px] text-white font-medium">
-                  {idx + 1} / {images.length}
-                </div>
-              </>
-            )}
-          </>
-        ) : (
-          <div className="h-80 flex flex-col items-center justify-center text-ink-400 gap-3">
-            <div className="animate-spin rounded-full h-8 w-8 border-b-2 border-brand-600" />
-            <span className="text-xs font-medium italic">Wait while AI crafting your visual...</span>
-          </div>
-        )}
-      </div>
-
-      {/* Social Stats */}
-      <div className="px-3 py-2 border-b border-black/5 flex items-center justify-between">
-        <div className="flex items-center">
-          <div className="flex -space-x-1">
-            <span className="h-4 w-4 rounded-full bg-blue-500 border border-white flex items-center justify-center text-[8px] text-white">👍</span>
-            <span className="h-4 w-4 rounded-full bg-red-400 border border-white flex items-center justify-center text-[8px] text-white">❤️</span>
-          </div>
-          <span className="text-[11px] text-black/60 ml-2">You and 12 others</span>
-        </div>
-        <div className="text-[11px] text-black/60 hover:text-blue-700 hover:underline cursor-pointer">4 comments</div>
-      </div>
-
-      {/* Action Bar */}
-      <div className="px-1 py-1 flex items-center justify-around">
-        <SocialBtn icon="👍" label="Like" />
-        <SocialBtn icon="💬" label="Comment" />
-        <SocialBtn icon="🔁" label="Repost" />
-        <SocialBtn icon="📤" label="Send" />
-      </div>
-    </div>
-  );
-}
-
-function SocialBtn({ icon, label }) {
-  return (
-    <button className="flex items-center gap-2 px-3 py-2 hover:bg-black/5 rounded font-semibold text-black/60 text-sm transition-colors">
-      <span className="text-lg grayscale">{icon}</span>
-      <span>{label}</span>
-    </button>
-  );
-}
+const PencilIcon = () => (
+  <svg viewBox="0 0 24 24" className="h-3.5 w-3.5" fill="none" stroke="currentColor" strokeWidth="2">
+    <path d="M12 20h9M16.5 3.5a2.12 2.12 0 0 1 3 3L7 19l-4 1 1-4L16.5 3.5z" strokeLinecap="round" strokeLinejoin="round" />
+  </svg>
+);
+const SaveIcon = () => (
+  <svg viewBox="0 0 24 24" className="h-3.5 w-3.5" fill="none" stroke="currentColor" strokeWidth="2.5">
+    <path d="M5 13l4 4 10-10" strokeLinecap="round" strokeLinejoin="round" />
+  </svg>
+);
+const ApproveIcon = () => (
+  <svg viewBox="0 0 24 24" className="h-3.5 w-3.5" fill="none" stroke="currentColor" strokeWidth="2.5">
+    <path d="M5 13l4 4 10-10" strokeLinecap="round" strokeLinejoin="round" />
+  </svg>
+);
+const RejectIcon = () => (
+  <svg viewBox="0 0 24 24" className="h-3.5 w-3.5" fill="none" stroke="currentColor" strokeWidth="2.5">
+    <path d="M6 6l12 12M6 18L18 6" strokeLinecap="round" />
+  </svg>
+);
+const ExpandIcon = () => (
+  <svg viewBox="0 0 24 24" className="h-3.5 w-3.5" fill="none" stroke="currentColor" strokeWidth="2">
+    <path d="M15 3h6v6M9 21H3v-6M21 3l-7 7M3 21l7-7" strokeLinecap="round" strokeLinejoin="round" />
+  </svg>
+);

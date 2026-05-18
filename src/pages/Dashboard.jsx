@@ -1,15 +1,35 @@
 import React, { useEffect, useMemo, useState } from 'react';
-import { FIELDS, AIRTABLE_PAT } from '../utils/config.js';
+import {
+  PLATFORM_LIST, PLATFORM_META,
+  primaryPublished, primaryApproval, primaryCaption,
+  primaryPostedAt, selectedImage, campaignPlatforms
+} from '../utils/config.js';
 import StatusBadge from '../components/StatusBadge.jsx';
+import { PlatformGlyph } from '../components/PlatformChip.jsx';
 import { Spinner } from '../components/Loader.jsx';
 
-function fmtDate(iso) {
-  if (!iso) return '—';
-  try { return new Date(iso).toLocaleDateString(undefined, { day: '2-digit', month: 'short' }); }
-  catch { return iso; }
+function fmtRelative(d) {
+  if (!d) return '';
+  const dt = new Date(d);
+  const now = new Date();
+  const diffDays = Math.round((dt.getTime() - now.getTime()) / 86400000);
+  if (diffDays === 0) return 'Today';
+  if (diffDays === 1) return 'Tomorrow';
+  if (diffDays === -1) return 'Yesterday';
+  if (diffDays > 1 && diffDays <= 7) return `In ${diffDays} days`;
+  if (diffDays < -1 && diffDays >= -7) return `${Math.abs(diffDays)} days ago`;
+  return dt.toLocaleDateString(undefined, { day: 'numeric', month: 'short' });
 }
 
-/* count-up animation hook */
+function fmtDayChip(d) {
+  if (!d) return { day: '—', mon: '' };
+  const dt = new Date(d);
+  return {
+    day: String(dt.getDate()).padStart(2, '0'),
+    mon: dt.toLocaleDateString(undefined, { month: 'short' }).toUpperCase()
+  };
+}
+
 function useCountUp(target, duration = 700) {
   const [value, setValue] = useState(0);
   useEffect(() => {
@@ -27,108 +47,154 @@ function useCountUp(target, duration = 700) {
   return value;
 }
 
-export default function Dashboard({ data, onNavigate }) {
-  const { records, loading, error, refresh } = data;
+// Δ% comparing items created in the last 7 days vs the prior 7 days
+function deltaPct(items, dateField = 'created_at') {
+  const now = Date.now();
+  const day = 86400000;
+  const last7  = items.filter(x => x[dateField] && (now - new Date(x[dateField]).getTime() <= 7 * day)).length;
+  const prev7  = items.filter(x => {
+    if (!x[dateField]) return false;
+    const t = new Date(x[dateField]).getTime();
+    return t < now - 7 * day && t >= now - 14 * day;
+  }).length;
+  if (prev7 === 0) return last7 > 0 ? 100 : 0;
+  return Math.round(((last7 - prev7) / prev7) * 100);
+}
+
+export default function Dashboard({ data, onNavigate, onNewPost }) {
+  const { campaigns, loading, error, refresh } = data;
+  const startNew = () => (onNewPost ? onNewPost() : onNavigate('post-creator'));
 
   const counts = useMemo(() => ({
-    total: records.length,
-    pending: records.filter(r => r.fields[FIELDS.published] === 'Pending').length,
-    approved: records.filter(r => r.fields[FIELDS.published] === 'Scheduled').length,
-    posted: records.filter(r => r.fields[FIELDS.published] === 'Posted').length
-  }), [records]);
-  const upcoming = useMemo(() => {
-    return records
-      .filter(r => {
-        const status = r.fields[FIELDS.approvalStatus];
-        return status === 'Pending';
-      })
-      .sort((a, b) => new Date(b.fields[FIELDS.date] || 0) - new Date(a.fields[FIELDS.date] || 0))
-      .slice(0, 4);
-  }, [records]);
+    total:     campaigns.length,
+    drafts:    campaigns.filter(c => primaryPublished(c) === 'draft').length,
+    scheduled: campaigns.filter(c => primaryPublished(c) === 'scheduled').length,
+    posted:    campaigns.filter(c => primaryPublished(c) === 'posted').length
+  }), [campaigns]);
 
-  const recent = useMemo(() => (
-    [...records]
-      .filter(r => r.fields[FIELDS.published] === 'Posted')
-      .sort((a, b) => new Date(b.fields[FIELDS.postDate] || 0) - new Date(a.fields[FIELDS.postDate] || 0))
-      .slice(0, 4)
-  ), [records]);
+  const deltas = useMemo(() => ({
+    total: deltaPct(campaigns),
+    drafts: deltaPct(campaigns.filter(c => primaryPublished(c) === 'draft')),
+    scheduled: deltaPct(campaigns.filter(c => primaryPublished(c) === 'scheduled')),
+    posted: deltaPct(campaigns.filter(c => primaryPublished(c) === 'posted'))
+  }), [campaigns]);
+
+  const upcoming = useMemo(() => {
+    return campaigns
+      .filter(c => primaryPublished(c) !== 'posted')
+      .sort((a, b) => new Date(a.event_date || a.created_at || 0) - new Date(b.event_date || b.created_at || 0))
+      .slice(0, 5);
+  }, [campaigns]);
+
+  // Counts campaigns where each platform has actually shipped (published_status === 'posted').
+  // Falls back to "platforms_selected" counts only if no posts have shipped yet, so the chart
+  // still shows reach intent on a fresh account.
+  const platformDist = useMemo(() => {
+    const postedCounts = PLATFORM_LIST.map(p => ({
+      id: p,
+      meta: PLATFORM_META[p],
+      count: campaigns.filter(c => c[`${p}_published_status`] === 'posted').length
+    }));
+    const anyPosted = postedCounts.some(p => p.count > 0);
+    const source = anyPosted
+      ? postedCounts
+      : PLATFORM_LIST.map(p => ({
+          id: p,
+          meta: PLATFORM_META[p],
+          count: campaigns.filter(c => campaignPlatforms(c).includes(p)).length
+        }));
+    return { rows: source.sort((a, b) => b.count - a.count), mode: anyPosted ? 'posted' : 'selected' };
+  }, [campaigns]);
+
+  const platformMax = Math.max(1, ...platformDist.rows.map(p => p.count));
 
   return (
     <>
-      <TopBar title="Dashboard" loading={loading} onRefresh={refresh} />
+      <TopBar onNewPost={startNew} />
 
       <main className="px-4 lg:px-10 py-8 max-w-6xl w-full">
-        {!AIRTABLE_PAT && (
-          <div className="mb-6 rounded-xl border border-brand-300/40 bg-brand-50 px-4 py-3 text-sm text-brand-800 animate-fade-up">
-            <strong>Missing credentials.</strong> Add <code className="px-1 bg-white/60 rounded">VITE_AIRTABLE_PAT</code> to your <code className="px-1 bg-white/60 rounded">.env</code> and restart the dev server.
-          </div>
-        )}
         {error && (
           <div className="mb-6 rounded-xl border border-accent-red/30 bg-brand-50 px-4 py-3 text-sm text-brand-800 animate-fade-up">
             {error}
           </div>
         )}
 
-        <header className="animate-fade-up">
-          {/* <div className="inline-flex items-center gap-2 text-[10px] lg:text-[11px] uppercase tracking-[0.18em] text-brand-700 font-semibold">
-            <span className="h-1.5 w-1.5 rounded-full bg-brand-700 animate-pulse-soft" />
-            Command Center
-          </div> */}
-          <h1 className="h-display text-3xl lg:text-5xl text-ink-900 mt-2">
-            Welcome back, <span className="bg-gradient-to-r from-brand-700 to-brand-500 bg-clip-text text-transparent">Admin</span>
-          </h1>
-          <p className="mt-2 lg:mt-3 text-ink-600 max-w-2xl text-sm lg:text-base">
-            Your content engine at a glance. Draft, schedule, and  LinkedIn posts on a single canvas.
-          </p>
+        <header className="animate-fade-up flex items-center justify-between gap-6 flex-wrap">
+          <div>
+            <h1 className="h-display text-3xl lg:text-4xl text-ink-900">Dashboard</h1>
+            <p className="text-ink-600 mt-1 text-sm">Your content engine across Instagram, X, LinkedIn and Facebook.</p>
+          </div>
+          <div className="flex items-center gap-2">
+            {PLATFORM_LIST.map(p => (
+              <span key={p} className="h-7 w-7 rounded-lg bg-white border border-cream-300/60 flex items-center justify-center" style={{ color: PLATFORM_META[p].color }} title={PLATFORM_META[p].label}>
+                <PlatformGlyph platform={p} className="h-4 w-4" />
+              </span>
+            ))}
+          </div>
         </header>
 
+        {/* KPI tiles */}
         <section className="grid grid-cols-2 lg:grid-cols-4 gap-3 lg:gap-4 mt-8 stagger">
-          <Stat label="Total Posts" value={counts.total} />
-          <Stat label="Pending" value={counts.pending} tone="amber" />
-          <Stat label="Scheduled" value={counts.approved} tone="green" />
-          <Stat label="Published" value={counts.posted} tone="blue" />
+          <KpiTile label="Total Posts" value={counts.total}     delta={deltas.total}     icon={<GridIcon />} />
+          <KpiTile label="Drafts"      value={counts.drafts}    delta={deltas.drafts}    icon={<DraftIcon />} />
+          <KpiTile label="Scheduled"   value={counts.scheduled} delta={deltas.scheduled} icon={<ClockIcon />} />
+          <KpiTile label="Published"   value={counts.posted}    delta={deltas.posted}    icon={<CheckIcon />} />
         </section>
 
+        {/* Upcoming + Platform Distribution */}
         <section className="grid grid-cols-1 lg:grid-cols-3 gap-5 mt-8 stagger">
+          {/* Upcoming */}
           <div className="lg:col-span-2 card card-hover p-6">
-            <div className="flex items-center justify-between mb-5">
-              <h2 className="h-display text-2xl text-ink-900">Upcoming</h2>
+            <div className="flex items-center justify-between mb-1">
+              <h2 className="h-display text-2xl text-ink-900">Upcoming Posts</h2>
               <button onClick={() => onNavigate('schedule')}
                 className="text-sm text-brand-700 font-medium inline-flex items-center gap-1 hover:gap-2 transition-all duration-200">
                 View pipeline <span aria-hidden>→</span>
               </button>
             </div>
-            {loading && !records.length ? (
+            <p className="text-xs text-ink-500 mb-5">Review and manage your next scheduled posts</p>
+
+            {loading && !campaigns.length ? (
               <Skeleton rows={4} />
             ) : upcoming.length === 0 ? (
               <Empty
                 title="Nothing on deck"
                 hint="Draft a new post to start filling your pipeline."
-                action={<button onClick={() => onNavigate('post-creator')} className="btn-primary mt-4">Create Post</button>}
+                action={<button onClick={startNew} className="btn-primary mt-4">Create Post</button>}
               />
             ) : (
-              <ul className="divide-y divide-cream-200">
-                {upcoming.map((r, i) => {
-                  const f = r.fields;
-                  const datePart = fmtDate(f[FIELDS.postDate] || f[FIELDS.date]).split(' ');
+              <ul className="space-y-3">
+                {upcoming.map((c, i) => {
+                  const chip = fmtDayChip(c.event_date || c.created_at);
+                  const status = primaryPublished(c);
                   return (
-                    <li key={r.id}
-                      onClick={() => onNavigate('post-creator', r.id)}
+                    <li key={c.post_id}
+                      onClick={() => onNavigate('post-creator', c.post_id)}
                       style={{ animationDelay: `${80 + i * 50}ms` }}
-                      className="py-3 flex items-center gap-4 animate-fade-up group cursor-pointer rounded-lg px-2 -mx-2 hover:bg-cream-50 transition">
-                      <div className="h-11 w-11 rounded-xl bg-gradient-to-br from-brand-100 to-brand-50 text-brand-700 font-semibold flex flex-col items-center justify-center text-xs leading-tight ring-1 ring-brand-100 group-hover:scale-105 transition-transform">
-                        <span>{datePart[1]}</span>
-                        <span className="text-[10px] -mt-0.5">{datePart[0]}</span>
+                      className="py-3 flex items-center gap-4 animate-fade-up group cursor-pointer rounded-xl px-3 -mx-3 hover:bg-cream-50 transition">
+                      <div className="h-12 w-12 rounded-xl bg-gradient-to-br from-brand-100 to-brand-50 text-brand-700 flex flex-col items-center justify-center ring-1 ring-brand-100 shrink-0">
+                        <span className="text-[10px] uppercase tracking-wider font-bold text-brand-600">{chip.mon}</span>
+                        <span className="text-base font-bold leading-none">{chip.day}</span>
                       </div>
                       <div className="min-w-0 flex-1">
-                        <div className="font-medium text-ink-900 truncate group-hover:text-brand-700 transition-colors">
-                          {f[FIELDS.eventName] || '(untitled)'}
+                        <div className="flex items-center gap-2 flex-wrap">
+                          <div className="font-bold text-ink-900 group-hover:text-brand-700 transition-colors truncate">
+                            {c.event_name || '(untitled)'}
+                          </div>
+                          <div className="flex items-center gap-1">
+                            {campaignPlatforms(c).map(p => (
+                              <span key={p} className="text-[9px] font-bold uppercase tracking-wider rounded px-1.5 py-0.5"
+                                style={{ background: `${PLATFORM_META[p]?.color}18`, color: PLATFORM_META[p]?.color }}>
+                                {PLATFORM_META[p]?.label}
+                              </span>
+                            ))}
+                          </div>
                         </div>
                         <div className="text-xs text-ink-500 mt-0.5 truncate">
-                          {f[FIELDS.captionDraft]?.slice(0, 80) || f[FIELDS.imagePrompt] || '—'}
+                          {primaryCaption(c)?.slice(0, 100) || c.user_image_prompt || '—'}
                         </div>
                       </div>
-                      <StatusBadge value={f[FIELDS.approvalStatus]} />
+                      <StatusBadge value={cap(status)} />
                     </li>
                   );
                 })}
@@ -136,106 +202,147 @@ export default function Dashboard({ data, onNavigate }) {
             )}
           </div>
 
-          <div className="relative overflow-hidden rounded-2xl bg-brand-gradient  text-white p-6 shadow-lift animate-scale-in">
-            {/* decorative orbs */}
-            <div className="absolute -top-12 -right-10 h-40 w-40 rounded-full bg-white/10 blur-2xl" />
-            <div className="absolute -bottom-16 -left-10 h-44 w-44 rounded-full bg-brand-300/20 blur-3xl" />
-
-            <div className="relative ">
-              <div className="text-[11px] uppercase tracking-[0.18em] text-brand-200">Quick Action</div>
-              <h3 className="h-display text-2xl mt-2">Draft today's influence</h3>
-              <p className="text-sm text-brand-100/90 mt-2">
-                From blank page to scheduled post in under three minutes with the AI-assisted creator.
-              </p>
-              <button
-                onClick={() => onNavigate('post-creator')}
-                className="mt-5 group bg-white text-brand-700 hover:bg-cream-100 transition-all rounded-lg px-4 py-2.5 font-semibold text-sm inline-flex items-center gap-2 hover:gap-3 shadow-soft hover:shadow-lift"
-              >
-                Open Post Creator
-                <span aria-hidden className="transition-transform group-hover:translate-x-0.5">→</span>
-              </button>
-            </div>
+          {/* Platform Distribution */}
+          <div className="card p-6">
+            <h2 className="h-display text-xl text-ink-900">Platform Distribution</h2>
+            <p className="text-xs text-ink-500 mt-1 mb-5">
+              {platformDist.mode === 'posted' ? 'Posts published per platform' : 'Campaigns per platform (no posts published yet)'}
+            </p>
+            <ul className="space-y-4">
+              {platformDist.rows.map(({ id, meta, count }) => {
+                const pct = (count / platformMax) * 100;
+                return (
+                  <li key={id} className="animate-fade-up">
+                    <div className="flex items-center justify-between mb-1.5">
+                      <div className="flex items-center gap-2 text-sm text-ink-900">
+                        <span style={{ color: meta.color }}><PlatformGlyph platform={id} className="h-4 w-4" /></span>
+                        <span className="font-medium">{meta.label}</span>
+                      </div>
+                      <span className="text-sm font-bold text-ink-900 tabular-nums">{count}</span>
+                    </div>
+                    <div className="h-1.5 rounded-full bg-cream-100 overflow-hidden">
+                      <div className="h-full rounded-full transition-[width] duration-700 ease-snap"
+                        style={{ width: `${pct}%`, background: meta.color }} />
+                    </div>
+                  </li>
+                );
+              })}
+            </ul>
           </div>
         </section>
 
+        {/* Recently Published */}
         <section className="mt-8 card p-6 animate-fade-up">
           <div className="flex items-center justify-between mb-5">
             <h2 className="h-display text-2xl text-ink-900">Recently Published</h2>
-            <button onClick={refresh} className="text-sm text-ink-500 hover:text-ink-900 inline-flex items-center gap-1.5 transition-colors">
-              {loading ? <Spinner /> : <RefreshIcon />}
-              Refresh
-            </button>
           </div>
-          {recent.length === 0 ? (
-            <Empty title="No posts published yet" hint="Once a post ships to LinkedIn it will land here." />
-          ) : (
-            <div className="grid grid-cols-1 md:grid-cols-2 gap-4 stagger">
-              {recent.map((r) => {
-                const f = r.fields;
-                return (
-                  <a
-                    key={r.id}
-                    href={f[FIELDS.linkedinUrl] || '#'}
-                    target="_blank"
-                    rel="noreferrer"
-                    className="group rounded-xl border border-cream-200 hover:border-brand-300/60 hover:shadow-lift hover:-translate-y-0.5 transition-all duration-200 p-4 flex gap-4"
-                  >
-                    <div className="h-20 w-20 rounded-lg overflow-hidden bg-cream-200 shrink-0">
-                      {f[FIELDS.generatedImage] ? (
-                        <img src={f[FIELDS.generatedImage]} alt=""
-                          className="w-full h-full object-cover transition-transform duration-500 group-hover:scale-110" />
-                      ) : null}
+          {(() => {
+            const recent = [...campaigns]
+              .filter(c => primaryPublished(c) === 'posted')
+              .sort((a, b) => new Date(primaryPostedAt(b) || 0) - new Date(primaryPostedAt(a) || 0));
+            if (recent.length === 0) return <Empty title="No posts published yet" hint="Once a post ships, it will land here." />;
+            return (
+              <div className="max-h-[560px] overflow-y-auto pr-2 -mr-1 space-y-4 stagger">
+                {recent.map(c => {
+                  const img = selectedImage(c);
+                  // Show a chip for every platform where there's evidence of a publish:
+                  //   - status flipped to 'posted', OR
+                  //   - a post URL was written (n8n may write the URL before/without the status flip)
+                  // Sweeps all four platforms, not just `platforms_selected`, so chips appear even
+                  // if a campaign was published to a platform that wasn't in the initial selection.
+                  const postedPlatforms = PLATFORM_LIST.filter(p =>
+                    c[`${p}_published_status`] === 'posted' || c[`${p}_post_url`]
+                  );
+                  return (
+                    <div
+                      key={c.post_id}
+                      onClick={() => onNavigate('post-creator', c.post_id)}
+                      className="group rounded-xl border border-cream-200 hover:border-brand-300/60 hover:shadow-lift hover:-translate-y-0.5 transition-all duration-200 p-5 flex items-stretch gap-5 cursor-pointer"
+                    >
+                      {/* Image — larger thumbnail */}
+                      <div className="h-32 w-32 lg:h-36 lg:w-36 rounded-xl overflow-hidden bg-cream-200 shrink-0">
+                        {img && <img src={img} alt="" className="w-full h-full object-cover transition-transform duration-500 group-hover:scale-110" />}
+                      </div>
+
+                      {/* Middle — title + caption */}
+                      <div className="min-w-0 flex-1 flex flex-col justify-center">
+                        <div className="text-xs text-ink-500">{fmtRelative(primaryPostedAt(c))}</div>
+                        <div className="text-lg font-bold text-ink-900 truncate group-hover:text-brand-700 transition-colors mt-1">
+                          {c.event_name || '(untitled)'}
+                        </div>
+                        <div className="text-sm text-ink-500 mt-1.5 line-clamp-2">{primaryCaption(c) || '—'}</div>
+                      </div>
+
+                      {/* Right — per-platform link buttons stacked vertically */}
+                      <div className="shrink-0 flex flex-col gap-2 justify-center self-center min-w-[160px]">
+                        {postedPlatforms.length === 0 ? (
+                          <span className="text-[11px] text-ink-400 italic px-2">No post URL yet</span>
+                        ) : (
+                          postedPlatforms.map(p => {
+                            const meta = PLATFORM_META[p];
+                            const href = c[`${p}_post_url`];
+                            const disabled = !href;
+                            const Tag = disabled ? 'span' : 'a';
+                            const tagProps = disabled
+                              ? { 'aria-disabled': true, title: 'Post URL not available yet' }
+                              : { href, target: '_blank', rel: 'noreferrer', onClick: (e) => e.stopPropagation() };
+                            return (
+                              <Tag
+                                key={p}
+                                {...tagProps}
+                                style={{ background: meta.color, color: '#fff' }}
+                                className={[
+                                  'inline-flex items-center justify-center gap-1.5 rounded-lg px-3 py-2 text-xs font-bold transition-all',
+                                  disabled ? 'opacity-50 cursor-not-allowed' : 'hover:shadow-lift hover:-translate-y-0.5'
+                                ].join(' ')}
+                              >
+                                <PlatformGlyph platform={p} className="h-3.5 w-3.5" />
+                                View on {meta.label}
+                                {!disabled && <span aria-hidden>↗</span>}
+                              </Tag>
+                            );
+                          })
+                        )}
+                      </div>
                     </div>
-                    <div className="min-w-0 flex-1">
-                      <div className="text-xs text-ink-500">{fmtDate(f[FIELDS.postDate])}</div>
-                      <div className="font-medium text-ink-900 truncate group-hover:text-brand-700 transition-colors">{f[FIELDS.eventName] || '(untitled)'}</div>
-                      <div className="text-xs text-ink-500 mt-1 line-clamp-2">{f[FIELDS.captionDraft] || '—'}</div>
-                    </div>
-                  </a>
-                );
-              })}
-            </div>
-          )}
+                  );
+                })}
+              </div>
+            );
+          })()}
         </section>
       </main>
     </>
   );
 }
 
-function TopBar({ title, loading, onRefresh }) {
+function cap(s) { return s ? s.charAt(0).toUpperCase() + s.slice(1) : s; }
+
+function TopBar({ onNewPost }) {
   return (
     <header className="sticky top-0 z-20 glass border-b border-cream-300/60">
-      <div className="px-4 lg:px-10 lg:pr-48 h-16 flex items-center justify-between">
-        <div className="h-display text-2xl text-ink-900">{title}</div>
-        <div className="flex items-center gap-3">
-          <button
-            onClick={onRefresh}
-            disabled={loading}
-            className="rounded-lg p-2 text-ink-600 hover:bg-cream-100 hover:text-brand-700 disabled:opacity-50 transition-all"
-            title="Refresh"
-          >
-            {loading ? <Spinner /> : <RefreshIcon />}
-          </button>
-        </div>
+      <div className="px-4 lg:px-10 h-16 flex items-center justify-end">
+        <button onClick={onNewPost} className="btn-primary inline-flex items-center gap-2 px-4 py-2 text-sm">
+          <PlusIcon /> Create
+        </button>
       </div>
     </header>
   );
 }
 
-function Stat({ label, value, tone = 'brand' }) {
+function KpiTile({ label, value, delta, icon }) {
   const display = useCountUp(value);
-  const tones = {
-    brand: { num: 'text-brand-700', dot: 'bg-brand-700' },
-    amber: { num: 'text-accent-amber', dot: 'bg-accent-amber' },
-    green: { num: 'text-accent-green', dot: 'bg-accent-green' },
-    blue: { num: 'text-accent-blue', dot: 'bg-accent-blue' }
-  };
-  const t = tones[tone];
+  const positive = delta >= 0;
   return (
     <div className="card card-hover px-5 py-4 relative overflow-hidden">
-      <div className={`absolute top-3 right-3 h-2 w-2 rounded-full ${t.dot} animate-pulse-soft`} />
-      <div className={`text-3xl font-bold tabular-nums ${t.num}`}>{display}</div>
-      <div className="text-[11px] uppercase tracking-[0.16em] text-ink-500 mt-1">{label}</div>
+      <div className="flex items-start justify-between">
+        <div className="h-9 w-9 rounded-lg bg-cream-100 text-ink-600 flex items-center justify-center">{icon}</div>
+        <span className={`text-[11px] font-bold rounded-full px-2 py-0.5 inline-flex items-center gap-0.5 ${positive ? 'bg-green-50 text-accent-green' : 'bg-red-50 text-brand-700'}`}>
+          {positive ? '+' : ''}{delta}%
+        </span>
+      </div>
+      <div className="text-[10px] uppercase tracking-[0.16em] text-ink-500 mt-3 font-bold">{label}</div>
+      <div className="text-3xl font-bold tabular-nums text-ink-900 mt-1">{display}</div>
     </div>
   );
 }
@@ -263,5 +370,34 @@ function Empty({ title, hint, action }) {
 const RefreshIcon = () => (
   <svg viewBox="0 0 24 24" className="h-4 w-4" fill="none" stroke="currentColor" strokeWidth="2">
     <path d="M3 12a9 9 0 0 1 15.5-6.3L21 8M21 3v5h-5M21 12a9 9 0 0 1-15.5 6.3L3 16M3 21v-5h5" strokeLinecap="round" strokeLinejoin="round" />
+  </svg>
+);
+const PlusIcon = () => (
+  <svg viewBox="0 0 24 24" className="h-4 w-4" fill="none" stroke="currentColor" strokeWidth="2.5">
+    <path d="M12 5v14M5 12h14" strokeLinecap="round" />
+  </svg>
+);
+const GridIcon = () => (
+  <svg viewBox="0 0 24 24" className="h-4 w-4" fill="none" stroke="currentColor" strokeWidth="2">
+    <rect x="3" y="3" width="7" height="9" rx="1.5" />
+    <rect x="14" y="3" width="7" height="5" rx="1.5" />
+    <rect x="14" y="12" width="7" height="9" rx="1.5" />
+    <rect x="3" y="16" width="7" height="5" rx="1.5" />
+  </svg>
+);
+const DraftIcon = () => (
+  <svg viewBox="0 0 24 24" className="h-4 w-4" fill="none" stroke="currentColor" strokeWidth="2">
+    <circle cx="12" cy="12" r="9" /><path d="M12 8v5" strokeLinecap="round" />
+  </svg>
+);
+const ClockIcon = () => (
+  <svg viewBox="0 0 24 24" className="h-4 w-4" fill="none" stroke="currentColor" strokeWidth="2">
+    <rect x="3" y="5" width="18" height="16" rx="2" />
+    <path d="M3 9h18M8 3v4M16 3v4" strokeLinecap="round" />
+  </svg>
+);
+const CheckIcon = () => (
+  <svg viewBox="0 0 24 24" className="h-4 w-4" fill="none" stroke="currentColor" strokeWidth="2">
+    <circle cx="12" cy="12" r="9" /><path d="M8 12l3 3 5-6" strokeLinecap="round" strokeLinejoin="round" />
   </svg>
 );

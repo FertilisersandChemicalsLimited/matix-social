@@ -20,10 +20,19 @@ const ICONS = {
       <rect x="3" y="5" width="18" height="16" rx="2"/>
       <path d="M3 9h18M8 3v4M16 3v4" strokeLinecap="round"/>
     </svg>
+  ),
+  logs: (
+    <svg viewBox="0 0 24 24" className="h-5 w-5" fill="none" stroke="currentColor" strokeWidth="2">
+      <path d="M4 4h16v4H4zM4 12h16v4H4zM4 20h10v0" strokeLinecap="round" strokeLinejoin="round" />
+      <circle cx="7" cy="6" r="0.5" fill="currentColor" />
+      <circle cx="7" cy="14" r="0.5" fill="currentColor" />
+    </svg>
   )
 };
 
-export default function Sidebar({ nav, current, onNavigate, onCreate }) {
+export default function Sidebar({ nav, current, onNavigate, onCreate, session, onLogout }) {
+  const emailLetter = session?.email ? session.email.charAt(0).toUpperCase() : 'M';
+  const displayName = session?.email ? session.email.split('@')[0] : 'Matix';
   const [brandFirst, brandSecond] = APP_NAME.split(' ');
   return (
     <aside className="w-60 h-full bg-cream-100/90 backdrop-blur-xl border-r border-cream-300/60 flex flex-col relative overflow-hidden">
@@ -72,16 +81,27 @@ export default function Sidebar({ nav, current, onNavigate, onCreate }) {
           onClick={onCreate}
           className="w-full btn-primary flex items-center justify-center gap-2"
         >
-          <SparkIcon/> Create Post
+          <SparkIcon/> New Post
         </button>
         <div className="mt-3 flex items-center gap-3 px-1">
           <div className="h-9 w-9 rounded-full bg-gradient-to-br from-brand-300 to-brand-600 ring-2 ring-cream-50 shadow-soft flex items-center justify-center text-white font-semibold shrink-0">
-            E
+            {emailLetter}
           </div>
-          <div className="leading-tight min-w-0">
-            <div className="text-sm font-semibold text-ink-900 truncate">Executive</div>
-            <div className="text-[10px] uppercase tracking-wider text-ink-500 truncate">Architect</div>
+          <div className="leading-tight min-w-0 flex-1">
+            <div className="text-sm font-semibold text-ink-900 truncate">{displayName}</div>
+            <div className="text-[10px] uppercase tracking-wider text-ink-500 truncate">{session?.email || 'Signed in'}</div>
           </div>
+          {onLogout && (
+            <button
+              onClick={onLogout}
+              title="Sign out"
+              className="h-8 w-8 rounded-lg text-ink-500 hover:text-brand-700 hover:bg-cream-200/70 flex items-center justify-center transition-all shrink-0"
+            >
+              <svg viewBox="0 0 24 24" className="h-4 w-4" fill="none" stroke="currentColor" strokeWidth="2">
+                <path d="M16 17l5-5-5-5M21 12H9M9 21H5a2 2 0 0 1-2-2V5a2 2 0 0 1 2-2h4" strokeLinecap="round" strokeLinejoin="round" />
+              </svg>
+            </button>
+          )}
         </div>
       </div>
     </aside>
