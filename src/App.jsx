@@ -103,9 +103,12 @@ function Shell({ session, onLogout }) {
         </div>
         <button
           onClick={handleOpenPicker}
-          className="text-[10px] uppercase tracking-wider font-bold text-white bg-brand-gradient px-3 py-1.5 rounded-full"
+          className="bg-brand-gradient text-white font-bold rounded-lg px-3.5 py-1.5 text-xs inline-flex items-center gap-1.5 shadow-soft hover:shadow-lift transition-all"
         >
-          + New
+          <svg viewBox="0 0 24 24" className="h-3.5 w-3.5" fill="none" stroke="currentColor" strokeWidth="2.5">
+            <path d="M12 5v14M5 12h14" strokeLinecap="round" />
+          </svg>
+          New Post
         </button>
       </div>
 

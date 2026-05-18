@@ -205,15 +205,22 @@ export default function Dashboard({ data, onNavigate, onNewPost }) {
                         <span className="text-base font-bold leading-none">{chip.day}</span>
                       </div>
                       <div className="min-w-0 flex-1">
-                        <div className="flex items-center gap-2 flex-wrap">
+                        {/* Title + platforms — stack vertically on mobile so the title doesn't
+                            compete with platform chips for horizontal space; inline on sm+ */}
+                        <div className="flex flex-col sm:flex-row sm:items-center sm:flex-wrap gap-1 sm:gap-2">
                           <div className="font-bold text-ink-900 group-hover:text-brand-700 transition-colors truncate">
                             {c.event_name || '(untitled)'}
                           </div>
-                          <div className="flex items-center gap-1">
+                          <div className="flex items-center gap-1 flex-wrap">
                             {campaignPlatforms(c).map(p => (
-                              <span key={p} className="text-[9px] font-bold uppercase tracking-wider rounded px-1.5 py-0.5"
-                                style={{ background: `${PLATFORM_META[p]?.color}18`, color: PLATFORM_META[p]?.color }}>
-                                {PLATFORM_META[p]?.label}
+                              <span key={p}
+                                className="text-[9px] font-bold uppercase tracking-wider rounded inline-flex items-center justify-center px-1.5 py-0.5"
+                                style={{ background: `${PLATFORM_META[p]?.color}18`, color: PLATFORM_META[p]?.color }}
+                                title={PLATFORM_META[p]?.label}
+                              >
+                                {/* Logo only on mobile (saves horizontal space); full label on sm+ */}
+                                <PlatformGlyph platform={p} className="h-3 w-3 sm:hidden" />
+                                <span className="hidden sm:inline">{PLATFORM_META[p]?.label}</span>
                               </span>
                             ))}
                           </div>
@@ -228,7 +235,7 @@ export default function Dashboard({ data, onNavigate, onNewPost }) {
                           type="button"
                           onClick={(e) => { e.stopPropagation(); setDeleteTarget(c); }}
                           title="Delete this campaign"
-                          className="h-8 w-8 rounded-lg text-ink-500 hover:text-brand-700 hover:bg-red-50 flex items-center justify-center transition-all opacity-0 group-hover:opacity-100"
+                          className="h-8 w-8 rounded-lg text-ink-500 hover:text-brand-700 hover:bg-red-50 flex items-center justify-center transition-all opacity-100 sm:opacity-0 sm:group-hover:opacity-100 shrink-0"
                         >
                           <svg viewBox="0 0 24 24" className="h-4 w-4" fill="none" stroke="currentColor" strokeWidth="2">
                             <path d="M3 6h18M8 6V4a2 2 0 0 1 2-2h4a2 2 0 0 1 2 2v2M19 6l-1 14a2 2 0 0 1-2 2H8a2 2 0 0 1-2-2L5 6M10 11v6M14 11v6" strokeLinecap="round" strokeLinejoin="round" />
@@ -297,24 +304,27 @@ export default function Dashboard({ data, onNavigate, onNewPost }) {
                     <div
                       key={c.post_id}
                       onClick={() => onNavigate('post-creator', c.post_id)}
-                      className="group rounded-xl border border-cream-200 hover:border-brand-300/60 hover:shadow-lift hover:-translate-y-0.5 transition-all duration-200 p-5 flex items-stretch gap-5 cursor-pointer"
+                      className="group rounded-xl border border-cream-200 hover:border-brand-300/60 hover:shadow-lift hover:-translate-y-0.5 transition-all duration-200 p-4 sm:p-5 flex flex-col sm:flex-row sm:items-stretch gap-4 sm:gap-5 cursor-pointer"
                     >
-                      {/* Image — larger thumbnail */}
-                      <div className="h-32 w-32 lg:h-36 lg:w-36 rounded-xl overflow-hidden bg-cream-200 shrink-0">
-                        {img && <img src={img} alt="" className="w-full h-full object-cover transition-transform duration-500 group-hover:scale-110" />}
-                      </div>
-
-                      {/* Middle — title + caption */}
-                      <div className="min-w-0 flex-1 flex flex-col justify-center">
-                        <div className="text-xs text-ink-500">{fmtRelative(primaryPostedAt(c))}</div>
-                        <div className="text-lg font-bold text-ink-900 truncate group-hover:text-brand-700 transition-colors mt-1">
-                          {c.event_name || '(untitled)'}
+                      {/* Top row on mobile (image + text) */}
+                      <div className="flex items-start gap-3 sm:contents">
+                        {/* Image — smaller on mobile */}
+                        <div className="h-20 w-20 sm:h-32 sm:w-32 lg:h-36 lg:w-36 rounded-xl overflow-hidden bg-cream-200 shrink-0">
+                          {img && <img src={img} alt="" className="w-full h-full object-cover transition-transform duration-500 group-hover:scale-110" />}
                         </div>
-                        <div className="text-sm text-ink-500 mt-1.5 line-clamp-2">{primaryCaption(c) || '—'}</div>
+
+                        {/* Middle — title + caption */}
+                        <div className="min-w-0 flex-1 flex flex-col justify-center">
+                          <div className="text-[11px] sm:text-xs text-ink-500">{fmtRelative(primaryPostedAt(c))}</div>
+                          <div className="text-base sm:text-lg font-bold text-ink-900 truncate group-hover:text-brand-700 transition-colors mt-1">
+                            {c.event_name || '(untitled)'}
+                          </div>
+                          <div className="text-xs sm:text-sm text-ink-500 mt-1 sm:mt-1.5 line-clamp-2">{primaryCaption(c) || '—'}</div>
+                        </div>
                       </div>
 
-                      {/* Right — per-platform link buttons stacked vertically */}
-                      <div className="shrink-0 flex flex-col gap-2 justify-center self-center min-w-[160px]">
+                      {/* Actions — full-width horizontal row on mobile, stacked vertical column on sm+ */}
+                      <div className="shrink-0 flex flex-row flex-wrap sm:flex-col gap-2 sm:justify-center sm:self-center sm:min-w-[160px]">
                         {postedPlatforms.length === 0 ? (
                           <span className="text-[11px] text-ink-400 italic px-2">No post URL yet</span>
                         ) : (
@@ -332,13 +342,15 @@ export default function Dashboard({ data, onNavigate, onNewPost }) {
                                 {...tagProps}
                                 style={{ background: meta.color, color: '#fff' }}
                                 className={[
-                                  'inline-flex items-center justify-center gap-1.5 rounded-lg px-3 py-2 text-xs font-bold transition-all',
+                                  'inline-flex items-center justify-center gap-1.5 rounded-lg px-2.5 py-1.5 sm:px-3 sm:py-2 text-[11px] sm:text-xs font-bold transition-all',
                                   disabled ? 'opacity-50 cursor-not-allowed' : 'hover:shadow-lift hover:-translate-y-0.5'
                                 ].join(' ')}
+                                title={`View on ${meta.label}`}
                               >
                                 <PlatformGlyph platform={p} className="h-3.5 w-3.5" />
-                                View on {meta.label}
-                                {!disabled && <span aria-hidden>↗</span>}
+                                {/* Icon-only on mobile (saves width); full text on sm+ */}
+                                <span className="hidden sm:inline">View on {meta.label}</span>
+                                {!disabled && <span aria-hidden className="hidden sm:inline">↗</span>}
                               </Tag>
                             );
                           })
@@ -370,8 +382,10 @@ export default function Dashboard({ data, onNavigate, onNewPost }) {
 function cap(s) { return s ? s.charAt(0).toUpperCase() + s.slice(1) : s; }
 
 function TopBar({ onNewPost }) {
+  // Hidden on mobile — the global mobile bar (App.jsx) already exposes "+ New" so this
+  // page-level Create button would be a duplicate. Visible on lg+ where there is no global bar.
   return (
-    <header className="sticky top-0 z-20 glass border-b border-cream-300/60">
+    <header className="hidden lg:block sticky top-0 z-20 glass border-b border-cream-300/60">
       <div className="px-4 lg:px-10 h-16 flex items-center justify-end">
         <button onClick={onNewPost} className="btn-primary inline-flex items-center gap-2 px-4 py-2 text-sm">
           <PlusIcon /> Create
