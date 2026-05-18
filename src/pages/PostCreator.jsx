@@ -170,7 +170,7 @@ export default function PostCreator({ data, onNavigate, onClose, initialRecordId
   const [publishingState, setPublishingState] = useState(null);
   const [publishingNowMs, setPublishingNowMs] = useState(Date.now());
 
-  const ESTIMATED_GEN_SECONDS = 60;
+  const ESTIMATED_GEN_SECONDS = 90;
   const GEN_SAFETY_TIMEOUT_MS = 5 * 60 * 1000; // hard stop after 5 min
 
   const [schedDate, setSchedDate] = useState(new Date().toISOString().slice(0, 10));
