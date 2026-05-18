@@ -7,6 +7,9 @@ import {
   primaryPublished, primaryScheduledAt, primaryPostedAt,
   primaryCaption, selectedImage, campaignPlatforms
 } from '../utils/config.js';
+import DeleteConfirmModal from '../components/DeleteConfirmModal.jsx';
+import { useToast } from '../components/Toast.jsx';
+import { deleteCampaign } from '../services/webhook.js';
 
 function fmtRelative(d) {
   if (!d) return '';
@@ -44,8 +47,30 @@ export default function Schedule({ data, onNavigate, onNewPost }) {
   const [limit, setLimit] = useState(12);
   const [activeFilter, setActiveFilter] = useState('All');
   const [platformFilter, setPlatformFilter] = useState(null);
+  const [deleteTarget, setDeleteTarget] = useState(null); // campaign object pending deletion
+  const [deleteBusy, setDeleteBusy] = useState(false);
+  const toast = useToast();
 
   const startNew = () => (onNewPost ? onNewPost() : onNavigate('post-creator'));
+
+  const handleDelete = async () => {
+    if (!deleteTarget) return;
+    setDeleteBusy(true);
+    try {
+      await deleteCampaign(
+        deleteTarget.post_id,
+        deleteTarget.event_name || null,
+        Array.isArray(deleteTarget.platforms_selected) ? deleteTarget.platforms_selected : []
+      );
+      toast.success(`Deleted "${deleteTarget.event_name || 'campaign'}"`);
+      await refresh();
+      setDeleteTarget(null);
+    } catch (e) {
+      toast.error(e.message || 'Failed to delete campaign');
+    } finally {
+      setDeleteBusy(false);
+    }
+  };
 
   const counts = useMemo(() => ({
     Scheduled: campaigns.filter(c => primaryPublished(c) === 'scheduled').length,
@@ -180,7 +205,12 @@ export default function Schedule({ data, onNavigate, onNewPost }) {
             <>
               <div className="grid grid-cols-1 sm:grid-cols-2 lg:grid-cols-3 gap-5 stagger">
                 {visible.map(c => (
-                  <PipelineCard key={c.post_id} campaign={c} onClick={() => onNavigate('post-creator', c.post_id)} />
+                  <PipelineCard
+                    key={c.post_id}
+                    campaign={c}
+                    onClick={() => onNavigate('post-creator', c.post_id)}
+                    onDelete={() => setDeleteTarget(c)}
+                  />
                 ))}
               </div>
 
@@ -201,6 +231,17 @@ export default function Schedule({ data, onNavigate, onNewPost }) {
           )}
         </div>
       </main>
+
+      {deleteTarget && (
+        <DeleteConfirmModal
+          subject={deleteTarget.event_name || '(untitled campaign)'}
+          description="This will remove the campaign row from Supabase. The image, captions, scheduled times, and all platform data are erased. This can't be undone."
+          confirmLabel="Delete post"
+          busy={deleteBusy}
+          onConfirm={handleDelete}
+          onClose={() => !deleteBusy && setDeleteTarget(null)}
+        />
+      )}
     </>
   );
 }
@@ -224,10 +265,13 @@ function FilterChip({ label, count, active, onClick }) {
   );
 }
 
-function PipelineCard({ campaign, onClick }) {
+function PipelineCard({ campaign, onClick, onDelete }) {
   const status = primaryPublished(campaign);
   const img = selectedImage(campaign);
   const platforms = campaignPlatforms(campaign);
+
+  // Only allow deletion when nothing has shipped — published campaigns are protected.
+  const canDelete = !platforms.some(p => campaign[`${p}_published_status`] === 'posted');
 
   const statusTag =
     status === 'posted'    ? { text: 'POSTED',    cls: 'bg-accent-green text-white' } :
@@ -257,6 +301,20 @@ function PipelineCard({ campaign, onClick }) {
         <span className={`absolute top-3 right-3 text-[10px] font-bold tracking-wider rounded-md px-2 py-1 shadow-soft ${statusTag.cls}`}>
           {statusTag.text}
         </span>
+
+        {/* Delete — bottom-right of image, fades in on card hover */}
+        {canDelete && onDelete && (
+          <button
+            type="button"
+            onClick={(e) => { e.stopPropagation(); onDelete(); }}
+            title="Delete this campaign"
+            className="absolute bottom-3 right-3 h-8 w-8 rounded-full bg-white/95 hover:bg-red-50 text-ink-700 hover:text-brand-700 flex items-center justify-center shadow-soft transition-all opacity-0 group-hover:opacity-100"
+          >
+            <svg viewBox="0 0 24 24" className="h-4 w-4" fill="none" stroke="currentColor" strokeWidth="2">
+              <path d="M3 6h18M8 6V4a2 2 0 0 1 2-2h4a2 2 0 0 1 2 2v2M19 6l-1 14a2 2 0 0 1-2 2H8a2 2 0 0 1-2-2L5 6M10 11v6M14 11v6" strokeLinecap="round" strokeLinejoin="round" />
+            </svg>
+          </button>
+        )}
       </div>
 
       <div className="p-5">

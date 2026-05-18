@@ -7,6 +7,9 @@ import {
 import StatusBadge from '../components/StatusBadge.jsx';
 import { PlatformGlyph } from '../components/PlatformChip.jsx';
 import { Spinner } from '../components/Loader.jsx';
+import DeleteConfirmModal from '../components/DeleteConfirmModal.jsx';
+import { useToast } from '../components/Toast.jsx';
+import { deleteCampaign } from '../services/webhook.js';
 
 function fmtRelative(d) {
   if (!d) return '';
@@ -64,6 +67,28 @@ function deltaPct(items, dateField = 'created_at') {
 export default function Dashboard({ data, onNavigate, onNewPost }) {
   const { campaigns, loading, error, refresh } = data;
   const startNew = () => (onNewPost ? onNewPost() : onNavigate('post-creator'));
+  const toast = useToast();
+  const [deleteTarget, setDeleteTarget] = useState(null);
+  const [deleteBusy, setDeleteBusy]     = useState(false);
+
+  const handleDelete = async () => {
+    if (!deleteTarget) return;
+    setDeleteBusy(true);
+    try {
+      await deleteCampaign(
+        deleteTarget.post_id,
+        deleteTarget.event_name || null,
+        Array.isArray(deleteTarget.platforms_selected) ? deleteTarget.platforms_selected : []
+      );
+      toast.success(`Deleted "${deleteTarget.event_name || 'campaign'}"`);
+      await refresh();
+      setDeleteTarget(null);
+    } catch (e) {
+      toast.error(e.message || 'Failed to delete campaign');
+    } finally {
+      setDeleteBusy(false);
+    }
+  };
 
   const counts = useMemo(() => ({
     total:     campaigns.length,
@@ -167,6 +192,9 @@ export default function Dashboard({ data, onNavigate, onNewPost }) {
                 {upcoming.map((c, i) => {
                   const chip = fmtDayChip(c.event_date || c.created_at);
                   const status = primaryPublished(c);
+                  // Upcoming list only contains non-posted campaigns by construction,
+                  // so canDelete is effectively true here — but we still guard defensively.
+                  const canDelete = !campaignPlatforms(c).some(p => c[`${p}_published_status`] === 'posted');
                   return (
                     <li key={c.post_id}
                       onClick={() => onNavigate('post-creator', c.post_id)}
@@ -195,6 +223,18 @@ export default function Dashboard({ data, onNavigate, onNewPost }) {
                         </div>
                       </div>
                       <StatusBadge value={cap(status)} />
+                      {canDelete && (
+                        <button
+                          type="button"
+                          onClick={(e) => { e.stopPropagation(); setDeleteTarget(c); }}
+                          title="Delete this campaign"
+                          className="h-8 w-8 rounded-lg text-ink-500 hover:text-brand-700 hover:bg-red-50 flex items-center justify-center transition-all opacity-0 group-hover:opacity-100"
+                        >
+                          <svg viewBox="0 0 24 24" className="h-4 w-4" fill="none" stroke="currentColor" strokeWidth="2">
+                            <path d="M3 6h18M8 6V4a2 2 0 0 1 2-2h4a2 2 0 0 1 2 2v2M19 6l-1 14a2 2 0 0 1-2 2H8a2 2 0 0 1-2-2L5 6M10 11v6M14 11v6" strokeLinecap="round" strokeLinejoin="round" />
+                          </svg>
+                        </button>
+                      )}
                     </li>
                   );
                 })}
@@ -312,6 +352,17 @@ export default function Dashboard({ data, onNavigate, onNewPost }) {
           })()}
         </section>
       </main>
+
+      {deleteTarget && (
+        <DeleteConfirmModal
+          subject={deleteTarget.event_name || '(untitled campaign)'}
+          description="This will remove the campaign row from Supabase. The image, captions, scheduled times, and all platform data are erased. This can't be undone."
+          confirmLabel="Delete post"
+          busy={deleteBusy}
+          onConfirm={handleDelete}
+          onClose={() => !deleteBusy && setDeleteTarget(null)}
+        />
+      )}
     </>
   );
 }

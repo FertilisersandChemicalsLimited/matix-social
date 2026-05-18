@@ -1,11 +1,12 @@
 const ENDPOINTS = {
   generation:   import.meta.env.VITE_WEBHOOK_POST_GENERATION,
   regeneration: import.meta.env.VITE_WEBHOOK_POST_REGENERATION,
-  publishing:   import.meta.env.VITE_WEBHOOK_POST_PUBLISHING
+  publishing:   import.meta.env.VITE_WEBHOOK_POST_PUBLISHING,
+  delete:       import.meta.env.VITE_WEBHOOK_DELETE_RECORD
 };
 
 for (const [k, v] of Object.entries(ENDPOINTS)) {
-  if (!v) console.warn(`[webhook] Missing VITE_WEBHOOK_POST_${k.toUpperCase()} in .env`);
+  if (!v) console.warn(`[webhook] Missing endpoint URL for bucket "${k}" in .env`);
 }
 
 /**
@@ -85,3 +86,7 @@ export const postNow            = (post_id, platform, scheduled_at) =>
 
 export const schedulePlatform   = (post_id, platform, scheduled_at) =>
   fireWebhook('publishing', 'platform.schedule', { post_id, platform, scheduled_at });
+
+// DELETE — drop a whole campaign row (draft or scheduled only — caller must gate)
+export const deleteCampaign = (post_id, event_name, platforms_selected = []) =>
+  fireWebhook('delete', 'campaign.delete', { post_id, event_name, platforms_selected });

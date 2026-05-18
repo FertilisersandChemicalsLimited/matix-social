@@ -13,8 +13,9 @@ import {
   createCampaign, regenerateImage, regenerateVariants,
   regenerateCaption, saveCaptionEdit,
   approvePlatform, rejectPlatform,
-  postNow, schedulePlatform
+  postNow, schedulePlatform, deleteCampaign
 } from '../services/webhook.js';
+import DeleteConfirmModal from '../components/DeleteConfirmModal.jsx';
 
 function genPostId() {
   if (typeof crypto !== 'undefined' && crypto.randomUUID) return crypto.randomUUID();
@@ -154,6 +155,7 @@ export default function PostCreator({ data, onNavigate, onClose, initialRecordId
   const [genStartedAt, setGenStartedAt] = useState(null); // ms timestamp when Forge was clicked
   const [nowMs, setNowMs] = useState(Date.now());        // ticked every 500ms while generating so timer UI updates
   const [previewModalOpen, setPreviewModalOpen] = useState(false); // full-size preview modal
+  const [deleteModalOpen, setDeleteModalOpen]   = useState(false); // campaign delete confirmation
   // Tracks an in-flight Post Now / Schedule action waiting for Supabase to reflect the new status.
   // Shape: { platform: 'x', action: 'post'|'schedule', startedAt: ms } | null
   const [publishingState, setPublishingState] = useState(null);
@@ -455,6 +457,27 @@ export default function PostCreator({ data, onNavigate, onClose, initialRecordId
     finally { setBusy(null); }
   };
 
+  // True when the campaign exists AND no platform has shipped (no `_published_status === 'posted'`).
+  // Used to gate the delete UI — a posted campaign should not be removable from the dashboard.
+  const canDelete = !!campaign && !platforms.some(p => campaign?.[`${p}_published_status`] === 'posted');
+
+  const handleDelete = async () => {
+    if (!campaign || !canDelete) return;
+    setBusy('delete');
+    try {
+      await deleteCampaign(campaign.post_id, campaign.event_name || null, platforms);
+      toast.success(`Deleted "${campaign.event_name || 'campaign'}"`);
+      await refresh();
+      setDeleteModalOpen(false);
+      // Leave the page — the row is gone, so nothing here to edit anymore.
+      onClose?.();
+    } catch (e) {
+      toast.error(e.message || 'Failed to delete campaign');
+    } finally {
+      setBusy(null);
+    }
+  };
+
   /* ---------- /Action wiring ---------- */
 
   // For new post (no campaign) with no platforms — bounce back
@@ -503,6 +526,19 @@ export default function PostCreator({ data, onNavigate, onClose, initialRecordId
           <PlatformChipStrip platforms={platforms} campaign={campaign} />
 
           <div className="flex-1" />
+
+          {canDelete && (
+            <button
+              onClick={() => setDeleteModalOpen(true)}
+              className="rounded-full h-10 w-10 bg-white border border-cream-300 flex items-center justify-center text-ink-700 hover:bg-red-50 hover:text-brand-700 hover:border-red-200 transition-all"
+              aria-label="Delete campaign"
+              title="Delete this campaign"
+            >
+              <svg viewBox="0 0 24 24" className="h-4 w-4" fill="none" stroke="currentColor" strokeWidth="2">
+                <path d="M3 6h18M8 6V4a2 2 0 0 1 2-2h4a2 2 0 0 1 2 2v2M19 6l-1 14a2 2 0 0 1-2 2H8a2 2 0 0 1-2-2L5 6M10 11v6M14 11v6" strokeLinecap="round" strokeLinejoin="round" />
+              </svg>
+            </button>
+          )}
 
           <button
             onClick={onClose}
@@ -887,6 +923,17 @@ export default function PostCreator({ data, onNavigate, onClose, initialRecordId
           images={images}
           eventName={form.eventName}
           onClose={() => setPreviewModalOpen(false)}
+        />
+      )}
+
+      {deleteModalOpen && (
+        <DeleteConfirmModal
+          subject={campaign?.event_name || '(untitled campaign)'}
+          description="This will remove the campaign row from Supabase. The image, captions, scheduled times, and all platform data are erased. This can't be undone."
+          confirmLabel="Delete post"
+          busy={busy === 'delete'}
+          onConfirm={handleDelete}
+          onClose={() => busy !== 'delete' && setDeleteModalOpen(false)}
         />
       )}
 
