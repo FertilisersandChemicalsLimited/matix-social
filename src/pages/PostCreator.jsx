@@ -16,6 +16,7 @@ import {
   postNow, schedulePlatform, deleteCampaign
 } from '../services/webhook.js';
 import DeleteConfirmModal from '../components/DeleteConfirmModal.jsx';
+import RegenerateImagePromptModal from '../components/RegenerateImagePromptModal.jsx';
 
 function genPostId() {
   if (typeof crypto !== 'undefined' && crypto.randomUUID) return crypto.randomUUID();
@@ -165,6 +166,10 @@ export default function PostCreator({ data, onNavigate, onClose, initialRecordId
   const [nowMs, setNowMs] = useState(Date.now());        // ticked every 500ms while generating so timer UI updates
   const [previewModalOpen, setPreviewModalOpen] = useState(false); // full-size preview modal
   const [deleteModalOpen, setDeleteModalOpen]   = useState(false); // campaign delete confirmation
+  const [regenImageModalOpen, setRegenImageModalOpen] = useState(false); // edit-prompt-before-regenerate-image
+  // Per-platform 30s blur window after caption Regenerate is clicked. Map of platform -> Date.now() endpoint.
+  const [regenCaptionUntil, setRegenCaptionUntil] = useState({});
+  const [regenNowMs, setRegenNowMs] = useState(Date.now());
   // Tracks an in-flight Post Now / Schedule action waiting for Supabase to reflect the new status.
   // Shape: { platform: 'x', action: 'post'|'schedule', startedAt: ms } | null
   const [publishingState, setPublishingState] = useState(null);
@@ -191,6 +196,28 @@ export default function PostCreator({ data, onNavigate, onClose, initialRecordId
     const i = setInterval(() => { refresh(); }, 3000);
     return () => clearInterval(i);
   }, [generating, refresh]);
+
+  // While any platform is mid-regenerate, tick a clock + poll Supabase every 3s for fresh captions.
+  // Expired entries are swept out on each tick so the blur clears automatically after 30s.
+  useEffect(() => {
+    const anyActive = Object.values(regenCaptionUntil).some(t => t > Date.now());
+    if (!anyActive) return;
+    const tickI = setInterval(() => {
+      const now = Date.now();
+      setRegenNowMs(now);
+      setRegenCaptionUntil(prev => {
+        let changed = false;
+        const next = {};
+        for (const [k, v] of Object.entries(prev)) {
+          if (v > now) next[k] = v;
+          else changed = true;
+        }
+        return changed ? next : prev;
+      });
+    }, 500);
+    const pollI = setInterval(() => { refresh(); }, 3000);
+    return () => { clearInterval(tickI); clearInterval(pollI); };
+  }, [regenCaptionUntil, refresh]);
 
   // Hard timeout — if we're still generating after the safety cap, give up
   useEffect(() => {
@@ -343,12 +370,23 @@ export default function PostCreator({ data, onNavigate, onClose, initialRecordId
     }
   };
 
-  const handleRegenerateImage = async () => {
+  const handleRegenerateImage = () => {
+    if (!campaign) return;
+    // Pop the modal so the user can review/edit the previous Image Personal Touch
+    // before firing the regenerate webhook.
+    setRegenImageModalOpen(true);
+  };
+
+  const handleConfirmRegenerateImage = async (editedPrompt) => {
     if (!campaign) return;
     setBusy('image');
+    // Reflect the edited brief back into the form so the textarea (and any future
+    // regenerate) stays in sync with what was just sent.
+    setForm(f => ({ ...f, imagePrompt: editedPrompt }));
     try {
-      await regenerateImage(campaign.post_id, normalizePrompt(form.imagePrompt));
+      await regenerateImage(campaign.post_id, normalizePrompt(editedPrompt));
       toast.success('Regenerating image…');
+      setRegenImageModalOpen(false);
       await refresh();
     } catch (e) { toast.error(e.message); }
     finally { setBusy(null); }
@@ -369,11 +407,23 @@ export default function PostCreator({ data, onNavigate, onClose, initialRecordId
     if (!campaign) return;
     setBusy(`caption-${platform}`);
     setApprovalDirty(prev => ({ ...prev, [platform]: true }));
+    // Open a 30s blur+poll window on this platform's caption card. The effect above will
+    // refresh() every 3s during the window and auto-clear the entry when it expires.
+    setRegenCaptionUntil(prev => ({ ...prev, [platform]: Date.now() + 30000 }));
+    setRegenNowMs(Date.now());
     try {
       await regenerateCaption(campaign.post_id, platform, normalizePrompt(form.captionPrompt));
       toast.success(`Regenerating ${PLATFORM_META[platform]?.label} caption…`);
       await refresh();
-    } catch (e) { toast.error(e.message); }
+    } catch (e) {
+      toast.error(e.message);
+      // Webhook failed — drop the window immediately so the card unblurs.
+      setRegenCaptionUntil(prev => {
+        const next = { ...prev };
+        delete next[platform];
+        return next;
+      });
+    }
     finally { setBusy(null); }
   };
 
@@ -738,6 +788,8 @@ export default function PostCreator({ data, onNavigate, onClose, initialRecordId
                       onSaveEdit={(text, p) => handleSaveCaption(text, p)}
                       onApprove={(p) => handleApprove(p)}
                       approvalDirty={!!approvalDirty[pid]}
+                      regenUntilMs={regenCaptionUntil[pid] || 0}
+                      nowMs={regenNowMs}
                     />
                   ))}
                 </div>
@@ -882,14 +934,36 @@ export default function PostCreator({ data, onNavigate, onClose, initialRecordId
                   disabled={!isEditing || published === 'posted'}
                   className="input flex-1 min-w-[140px]"
                 />
-                <div className="flex items-center gap-1">
-                  <select value={schedHour} onChange={(e) => setSchedHour(e.target.value)} disabled={!isEditing || published === 'posted'} className="input w-16 px-2 text-center">
-                    {[1,2,3,4,5,6,7,8,9,10,11,12].map(h => <option key={h} value={h}>{h}</option>)}
-                  </select>
-                  <select value={schedAmpm} onChange={(e) => setSchedAmpm(e.target.value)} disabled={!isEditing || published === 'posted'} className="input w-16 px-1 text-center font-bold">
-                    <option value="AM">AM</option>
-                    <option value="PM">PM</option>
-                  </select>
+                <div className="flex items-center gap-2">
+                  <div className="relative">
+                    <select
+                      value={schedHour}
+                      onChange={(e) => setSchedHour(e.target.value)}
+                      disabled={!isEditing || published === 'posted'}
+                      className="input appearance-none w-20 pr-8 text-center tabular-nums font-semibold cursor-pointer"
+                    >
+                      {[1,2,3,4,5,6,7,8,9,10,11,12].map(h => (
+                        <option key={h} value={h}>{String(h).padStart(2, '0')}</option>
+                      ))}
+                    </select>
+                    <svg viewBox="0 0 24 24" className="pointer-events-none absolute right-2.5 top-1/2 -translate-y-1/2 h-3.5 w-3.5 text-ink-500" fill="none" stroke="currentColor" strokeWidth="2.5">
+                      <path d="M6 9l6 6 6-6" strokeLinecap="round" strokeLinejoin="round" />
+                    </svg>
+                  </div>
+                  <div className="relative">
+                    <select
+                      value={schedAmpm}
+                      onChange={(e) => setSchedAmpm(e.target.value)}
+                      disabled={!isEditing || published === 'posted'}
+                      className="input appearance-none w-20 pr-8 text-center font-bold cursor-pointer"
+                    >
+                      <option value="AM">AM</option>
+                      <option value="PM">PM</option>
+                    </select>
+                    <svg viewBox="0 0 24 24" className="pointer-events-none absolute right-2.5 top-1/2 -translate-y-1/2 h-3.5 w-3.5 text-ink-500" fill="none" stroke="currentColor" strokeWidth="2.5">
+                      <path d="M6 9l6 6 6-6" strokeLinecap="round" strokeLinejoin="round" />
+                    </svg>
+                  </div>
                 </div>
               </div>
 
@@ -943,6 +1017,15 @@ export default function PostCreator({ data, onNavigate, onClose, initialRecordId
           busy={busy === 'delete'}
           onConfirm={handleDelete}
           onClose={() => busy !== 'delete' && setDeleteModalOpen(false)}
+        />
+      )}
+
+      {regenImageModalOpen && (
+        <RegenerateImagePromptModal
+          initialPrompt={form.imagePrompt}
+          busy={busy === 'image'}
+          onConfirm={handleConfirmRegenerateImage}
+          onClose={() => busy !== 'image' && setRegenImageModalOpen(false)}
         />
       )}
 
@@ -1426,8 +1509,11 @@ function PlatformCaptionCard({
   editingPlatform, setEditingPlatform, draftEdit, setDraftEdit,
   busy,
   onRegenerate, onSaveEdit, onApprove,
-  approvalDirty
+  approvalDirty,
+  regenUntilMs = 0, nowMs = 0
 }) {
+  const regenActive = regenUntilMs > nowMs;
+  const regenRemaining = regenActive ? Math.max(1, Math.ceil((regenUntilMs - nowMs) / 1000)) : 0;
   const meta = PLATFORM_META[platform];
   const caption = campaign?.[`${platform}_caption`] || '';
   const approval = campaign?.[`${platform}_approval_status`] || 'draft';
@@ -1474,7 +1560,22 @@ function PlatformCaptionCard({
       </div>
 
       {/* Body */}
-      <div className="p-4">
+      <div className="p-4 relative">
+        {regenActive && (
+          <div className="absolute inset-0 z-10 flex items-center justify-center bg-white/30 backdrop-blur-md rounded-b-xl">
+            <div className="flex items-center gap-3 px-4 py-2.5 rounded-full bg-white/90 ring-1 ring-cream-300/70 shadow-soft">
+              <span className="h-6 w-6 rounded-full bg-brand-gradient text-white flex items-center justify-center shadow-glow">
+                <svg viewBox="0 0 24 24" className="h-3.5 w-3.5 animate-spin-slow" fill="none" stroke="currentColor" strokeWidth="2.5">
+                  <path d="M3 12a9 9 0 0 1 15.5-6.3L21 8M21 3v5h-5" strokeLinecap="round" strokeLinejoin="round" />
+                </svg>
+              </span>
+              <span className="text-sm font-semibold text-ink-900 tabular-nums">
+                Your content will be updated in {regenRemaining}s
+              </span>
+            </div>
+          </div>
+        )}
+        <div className={regenActive ? 'pointer-events-none select-none' : undefined}>
         {isEdit ? (
           <>
             <textarea
@@ -1554,6 +1655,7 @@ function PlatformCaptionCard({
             )}
           </>
         )}
+        </div>
       </div>
     </div>
   );

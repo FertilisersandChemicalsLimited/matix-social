@@ -11,8 +11,8 @@ import PlatformPickerModal from './components/PlatformPickerModal.jsx';
 
 const NAV = [
   { id: 'dashboard', label: 'Dashboard' },
-  { id: 'schedule',  label: 'Pipeline'  }
-  // { id: 'logs',  label: 'Logs' }  // hidden from sidebar — page still reachable programmatically
+  { id: 'schedule',  label: 'Pipeline'  },
+  // { id: 'logs',      label: 'Logs'      }
 ];
 
 const SESSION_KEY = 'matix:session';
