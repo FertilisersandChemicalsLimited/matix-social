@@ -1,4 +1,5 @@
-import React, { useState } from 'react';
+import React, { useEffect, useState } from 'react';
+import ReactDOM from 'react-dom';
 import { Spinner } from './Loader.jsx';
 
 /**
@@ -9,8 +10,10 @@ import { Spinner } from './Loader.jsx';
  */
 export default function ImageWorkbench({
   campaign, postType, readOnly = true, variantIdx = 0, onSelectVariant,
-  onRegenerateImage, onRegenerateVariants, busy, locked = false
+  onRegenerateImage, onRegenerateVariants, busy, locked = false,
+  regenUntilMs = 0, nowMs = 0, regenCount = 0, regenMax = 10
 }) {
+  const [lightboxSrc, setLightboxSrc] = useState(null);
   const imageStatus = campaign?.image_status || 'idle';
   const sources  = campaign?.source_image_urls || [];
   const variants = campaign?.generated_image_variants || [];
@@ -69,41 +72,128 @@ export default function ImageWorkbench({
   }
 
   // observance (default) — hide entirely if nothing to show
-  if (imageStatus !== 'generating' && imageStatus !== 'failed' && !variants[0]) {
+  if (imageStatus !== 'generating' && imageStatus !== 'failed' && variants.length === 0) {
     return null;
   }
+  const regenActive = regenUntilMs > nowMs;
+  const regenRemaining = regenActive ? Math.max(1, Math.ceil((regenUntilMs - nowMs) / 1000)) : 0;
+  const atRegenLimit = regenCount >= regenMax;
   return (
-    <Wrapper title="AI Visual" subtitle="One generated image">
+    <Wrapper
+      title="AI Variants"
+      subtitle="AI generated options · pick one"
+      headerRight={
+        <div className={`shrink-0 text-xs font-bold px-2.5 py-1 rounded-full tabular-nums ${atRegenLimit ? 'bg-red-100 text-red-600' : 'bg-cream-200 text-ink-600'}`}>
+          {regenCount}/{regenMax}
+        </div>
+      }
+    >
       {imageStatus === 'generating' && <GeneratingTile label="Crafting your visual…" small />}
       {imageStatus === 'failed' && <FailedTile small />}
-      {variants[0] && (
-        <div className="rounded-xl overflow-hidden border border-cream-300/60 bg-white max-w-[280px]">
-          <img src={variants[0]} alt="" referrerPolicy="no-referrer" className="w-full aspect-square object-cover" />
+      {variants.length > 0 && (
+        <div className="relative">
+          {regenActive && (
+            <div className="absolute inset-0 z-10 flex items-center justify-center bg-white/30 backdrop-blur-md rounded-xl">
+              <div className="flex items-center gap-3 px-4 py-2.5 rounded-full bg-white/90 ring-1 ring-cream-300/70 shadow-soft">
+                <span className="h-6 w-6 rounded-full bg-brand-gradient text-white flex items-center justify-center shadow-glow">
+                  <svg viewBox="0 0 24 24" className="h-3.5 w-3.5 animate-spin-slow" fill="none" stroke="currentColor" strokeWidth="2.5">
+                    <path d="M3 12a9 9 0 0 1 15.5-6.3L21 8M21 3v5h-5" strokeLinecap="round" strokeLinejoin="round" />
+                  </svg>
+                </span>
+                <span className="text-sm font-semibold text-ink-900 tabular-nums">
+                  Your image will be updated in {regenRemaining}s
+                </span>
+              </div>
+            </div>
+          )}
+          <div className={regenActive ? 'pointer-events-none select-none' : undefined}>
+            <div className="flex gap-3 overflow-x-auto scrollbar-none -mx-1 px-1 pb-1">
+              {variants.slice(0, 6).map((src, i) => (
+                <div key={i} className="flex flex-col items-center gap-1.5 shrink-0">
+                  <VariantTile
+                    src={src}
+                    index={i}
+                    selected={i === variantIdx}
+                    onClick={() => handlePick(i)}
+                  />
+                  <button
+                    type="button"
+                    onClick={() => setLightboxSrc(src)}
+                    className="text-[11px] font-medium text-ink-500 hover:text-brand-700 border border-cream-300 hover:border-brand-300 rounded-md px-2.5 py-0.5 transition-colors"
+                  >
+                    Preview
+                  </button>
+                </div>
+              ))}
+            </div>
+            {onRegenerateImage && (
+              <div className="flex items-center justify-end pt-2">
+                <button
+                  onClick={onRegenerateImage}
+                  disabled={busy === 'image' || locked || atRegenLimit}
+                  title={locked ? 'Image is locked — at least one platform has already been published.' : atRegenLimit ? 'Regeneration limit reached (10/10)' : undefined}
+                  className="btn-ghost inline-flex items-center gap-2 text-xs px-3 py-1.5 border-brand-200 text-brand-700 hover:bg-brand-50 disabled:opacity-50 disabled:cursor-not-allowed disabled:border-cream-300 disabled:text-ink-500 disabled:hover:bg-transparent"
+                >
+                  {busy === 'image' ? <Spinner /> : (locked || atRegenLimit ? <LockIcon /> : <RegenIcon />)}
+                  {locked ? 'Image locked (already posted)' : atRegenLimit ? 'Limit reached (10/10)' : 'Regenerate Image'}
+                </button>
+              </div>
+            )}
+          </div>
         </div>
       )}
-      {variants[0] && onRegenerateImage && (
-        <div className="flex items-center justify-end pt-2">
-          <button
-            onClick={onRegenerateImage}
-            disabled={busy === 'image' || locked}
-            title={locked ? 'Image is locked — at least one platform has already been published.' : undefined}
-            className="btn-ghost inline-flex items-center gap-2 text-xs px-3 py-1.5 border-brand-200 text-brand-700 hover:bg-brand-50 disabled:opacity-50 disabled:cursor-not-allowed disabled:border-cream-300 disabled:text-ink-500 disabled:hover:bg-transparent"
-          >
-            {busy === 'image' ? <Spinner /> : (locked ? <LockIcon /> : <RegenIcon />)}
-            {locked ? 'Image locked (already posted)' : 'Regenerate Image'}
-          </button>
-        </div>
+      {lightboxSrc && (
+        <Lightbox src={lightboxSrc} onClose={() => setLightboxSrc(null)} />
       )}
     </Wrapper>
   );
 }
 
-function Wrapper({ title, subtitle, children }) {
+function Lightbox({ src, onClose }) {
+  useEffect(() => {
+    const onKey = (e) => { if (e.key === 'Escape') onClose(); };
+    document.addEventListener('keydown', onKey);
+    return () => document.removeEventListener('keydown', onKey);
+  }, [onClose]);
+
+  return ReactDOM.createPortal(
+    <div
+      className="fixed inset-0 bg-black/75 backdrop-blur-md flex items-center justify-center p-6 animate-fade-in"
+      style={{ zIndex: 9999 }}
+      onClick={onClose}
+    >
+      <div className="relative" onClick={(e) => e.stopPropagation()}>
+        <button
+          onClick={onClose}
+          className="absolute -top-3 -right-3 h-8 w-8 rounded-full bg-white text-ink-700 shadow-lg flex items-center justify-center hover:bg-cream-100 transition-colors"
+          style={{ zIndex: 10000 }}
+          aria-label="Close"
+        >
+          <svg viewBox="0 0 24 24" className="h-4 w-4" fill="none" stroke="currentColor" strokeWidth="2.5">
+            <path d="M6 6l12 12M6 18L18 6" strokeLinecap="round" />
+          </svg>
+        </button>
+        <img
+          src={src}
+          alt=""
+          referrerPolicy="no-referrer"
+          className="max-h-[88vh] max-w-[88vw] rounded-xl shadow-2xl object-contain"
+        />
+      </div>
+    </div>,
+    document.body
+  );
+}
+
+function Wrapper({ title, subtitle, children, headerRight }) {
   return (
     <section className="card p-6 bg-gradient-to-br from-brand-50/40 to-cream-50">
-      <div className="mb-4">
-        <div className="text-[11px] uppercase tracking-[0.18em] text-ink-500 font-bold">{title}</div>
-        {subtitle && <div className="text-xs text-ink-500 mt-1">{subtitle}</div>}
+      <div className="mb-4 flex items-start justify-between gap-2">
+        <div>
+          <div className="text-[11px] uppercase tracking-[0.18em] text-ink-500 font-bold">{title}</div>
+          {subtitle && <div className="text-xs text-ink-500 mt-1">{subtitle}</div>}
+        </div>
+        {headerRight}
       </div>
       <div className="space-y-3">{children}</div>
     </section>

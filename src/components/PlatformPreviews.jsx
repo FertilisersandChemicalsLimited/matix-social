@@ -1,9 +1,10 @@
 import React, { useEffect, useLayoutEffect, useRef, useState } from 'react';
 import { PLATFORM_META } from '../utils/config.js';
 
-const DEFAULT_HANDLE = '@growwstacks';
-const DEFAULT_NAME   = 'GrowwStacks';
-const AVATAR_URL     = 'https://ui-avatars.com/api/?name=Growwstacks&background=b83a25&color=fff&size=128';
+const DEFAULT_HANDLE = '@matixfertiliser';
+const DEFAULT_NAME   = 'Matix Fertilisers and Chemicals';
+const DEFAULT_FULLNAME = 'Matix Fertilisers and Chemicals Limited';
+const AVATAR_URL     = 'https://ik.imagekit.io/matix/Matix%20Logo/matix_fertilisers__chemicals_limited_logo.jpg';
 
 export function PreviewSwitcher({ platform, caption, images = [], eventName }) {
   const props = { caption, images, eventName };
@@ -81,7 +82,7 @@ function Carousel({ images, alt = '', aspect = 'aspect-square', fit = 'cover' })
 
 // Clamps caption text to `lines` lines. If overflow is detected, renders a "...more" button
 // that toggles to the full text. Placeholder shown italic in muted color when caption is empty.
-function ClampedCaption({ caption, lines = 3, placeholder = 'Post text will appear here…', className = '' }) {
+function ClampedCaption({ caption, lines = 3, placeholder = 'Post text will appear here…', className = '', prefix = null }) {
   const [expanded, setExpanded] = useState(false);
   const [overflows, setOverflows] = useState(false);
   const ref = useRef(null);
@@ -93,7 +94,6 @@ function ClampedCaption({ caption, lines = 3, placeholder = 'Post text will appe
   useEffect(() => {
     const el = ref.current;
     if (!el) return;
-    // Measure after the browser has laid out the clamped block.
     const check = () => setOverflows(el.scrollHeight - el.clientHeight > 1);
     check();
     const ro = new ResizeObserver(check);
@@ -117,9 +117,10 @@ function ClampedCaption({ caption, lines = 3, placeholder = 'Post text will appe
         style={clampStyle}
         className="text-sm text-ink-900 whitespace-pre-wrap"
       >
+        {prefix && <span className="font-bold mr-1">{prefix}</span>}
         {caption || <span className="text-ink-400 italic">{placeholder}</span>}
       </div>
-      {overflows && (
+      {(overflows || expanded) && (
         <button
           type="button"
           onClick={() => setExpanded(e => !e)}
@@ -155,11 +156,14 @@ export function InstagramPreview({ caption, images = [], eventName }) {
         <BookmarkIcon />
       </div>
 
-      <div className="px-3 pb-3 text-xs">
-        <div className="text-ink-900 line-clamp-4 whitespace-pre-wrap">
-          <span className="font-bold mr-1">{DEFAULT_HANDLE}</span>
-          {caption || <span className="text-ink-400 italic">Caption will appear here…</span>}
-        </div>
+      <div className="px-3 pb-3">
+        <ClampedCaption
+          caption={caption}
+          lines={4}
+          prefix={DEFAULT_HANDLE}
+          placeholder="Caption will appear here…"
+          className="text-xs"
+        />
         <div className="text-[10px] text-ink-500 uppercase mt-1 tracking-wider">16 hours ago</div>
       </div>
 
@@ -176,10 +180,7 @@ export function XPreview({ caption, images = [], eventName }) {
         <div className="flex-1 min-w-0">
           <div className="flex items-center gap-1 text-sm">
             <span className="font-bold text-ink-900 truncate">{DEFAULT_NAME}</span>
-            <svg viewBox="0 0 24 24" className="h-4 w-4 text-accent-blue" fill="currentColor">
-              <path d="M22.5 12c0-1.46-.79-2.74-1.96-3.43.3-1.35-.1-2.81-1.13-3.84-1.03-1.03-2.49-1.43-3.84-1.13C14.74 2.43 13.46 1.64 12 1.64s-2.74.79-3.43 1.96c-1.35-.3-2.81.1-3.84 1.13-1.03 1.03-1.43 2.49-1.13 3.84C2.43 9.26 1.64 10.54 1.64 12s.79 2.74 1.96 3.43c-.3 1.35.1 2.81 1.13 3.84 1.03 1.03 2.49 1.43 3.84 1.13.69 1.17 1.97 1.96 3.43 1.96s2.74-.79 3.43-1.96c1.35.3 2.81-.1 3.84-1.13 1.03-1.03 1.43-2.49 1.13-3.84 1.17-.69 1.96-1.97 1.96-3.43zM9.65 16.27l-3.74-3.74 1.41-1.41 2.33 2.33 5.6-5.6 1.41 1.41-7.01 7.01z" />
-            </svg>
-            <span className="text-ink-500 text-xs">@growwstacks · 16h</span>
+            <span className="text-ink-500 text-xs shrink-0">{DEFAULT_HANDLE} · 4d</span>
             <div className="flex-1" />
             <button className="text-ink-500"><DotsHIcon /></button>
           </div>
@@ -191,7 +192,7 @@ export function XPreview({ caption, images = [], eventName }) {
           />
           {images.length > 0 && (
             <div className="mt-2 rounded-2xl overflow-hidden border border-cream-300">
-              <Carousel images={images} alt={eventName} aspect="aspect-video" />
+              <Carousel images={images} alt={eventName} aspect="aspect-square" />
             </div>
           )}
           <div className="mt-3 flex items-center justify-between text-ink-500 text-xs max-w-md">
@@ -214,12 +215,9 @@ export function LinkedInPreview({ caption, images = [], eventName }) {
       <div className="p-3 flex items-start gap-2">
         <img src={AVATAR_URL} alt="" className="h-11 w-11 rounded-full object-cover shrink-0" />
         <div className="flex-1 min-w-0">
-          <div className="flex items-center gap-1 text-sm">
-            <span className="font-bold text-ink-900 truncate">{DEFAULT_NAME}</span>
-            <span className="text-ink-500 text-xs">· 1st</span>
-          </div>
-          <div className="text-[11px] text-ink-500 truncate">Content Creator at GrowwStacks</div>
-          <div className="text-[11px] text-ink-500">16h · 🌐</div>
+          <div className="text-sm font-bold text-ink-900 truncate">{DEFAULT_FULLNAME}</div>
+          <div className="text-[11px] text-ink-500">26,817 followers</div>
+          <div className="text-[11px] text-ink-500">5d · 🌐</div>
         </div>
         <button className="text-ink-500"><DotsHIcon /></button>
       </div>

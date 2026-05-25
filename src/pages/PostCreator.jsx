@@ -170,6 +170,12 @@ export default function PostCreator({ data, onNavigate, onClose, initialRecordId
   // Per-platform 30s blur window after caption Regenerate is clicked. Map of platform -> Date.now() endpoint.
   const [regenCaptionUntil, setRegenCaptionUntil] = useState({});
   const [regenNowMs, setRegenNowMs] = useState(Date.now());
+  // 60s blur window after image Regenerate is confirmed. Single timestamp (one image per post).
+  const [regenImageUntilMs, setRegenImageUntilMs] = useState(0);
+  // Which platform's caption is awaiting user confirmation before regenerating.
+  const [regenCaptionConfirmPlatform, setRegenCaptionConfirmPlatform] = useState(null);
+  // Pending Post Now / Schedule confirmation: { action: 'post'|'schedule', platform }
+  const [publishConfirm, setPublishConfirm] = useState(null);
   // Tracks an in-flight Post Now / Schedule action waiting for Supabase to reflect the new status.
   // Shape: { platform: 'x', action: 'post'|'schedule', startedAt: ms } | null
   const [publishingState, setPublishingState] = useState(null);
@@ -200,7 +206,7 @@ export default function PostCreator({ data, onNavigate, onClose, initialRecordId
   // While any platform is mid-regenerate, tick a clock + poll Supabase every 3s for fresh captions.
   // Expired entries are swept out on each tick so the blur clears automatically after 30s.
   useEffect(() => {
-    const anyActive = Object.values(regenCaptionUntil).some(t => t > Date.now());
+    const anyActive = Object.values(regenCaptionUntil).some(t => t > Date.now()) || regenImageUntilMs > Date.now();
     if (!anyActive) return;
     const tickI = setInterval(() => {
       const now = Date.now();
@@ -214,10 +220,11 @@ export default function PostCreator({ data, onNavigate, onClose, initialRecordId
         }
         return changed ? next : prev;
       });
+      setRegenImageUntilMs(prev => prev > now ? prev : 0);
     }, 500);
     const pollI = setInterval(() => { refresh(); }, 3000);
     return () => { clearInterval(tickI); clearInterval(pollI); };
-  }, [regenCaptionUntil, refresh]);
+  }, [regenCaptionUntil, regenImageUntilMs, refresh]);
 
   // Hard timeout — if we're still generating after the safety cap, give up
   useEffect(() => {
@@ -380,15 +387,18 @@ export default function PostCreator({ data, onNavigate, onClose, initialRecordId
   const handleConfirmRegenerateImage = async (editedPrompt) => {
     if (!campaign) return;
     setBusy('image');
-    // Reflect the edited brief back into the form so the textarea (and any future
-    // regenerate) stays in sync with what was just sent.
     setForm(f => ({ ...f, imagePrompt: editedPrompt }));
+    setRegenImageUntilMs(Date.now() + 60000);
+    setRegenNowMs(Date.now());
     try {
       await regenerateImage(campaign.post_id, normalizePrompt(editedPrompt));
       toast.success('Regenerating image…');
       setRegenImageModalOpen(false);
       await refresh();
-    } catch (e) { toast.error(e.message); }
+    } catch (e) {
+      toast.error(e.message);
+      setRegenImageUntilMs(0);
+    }
     finally { setBusy(null); }
   };
 
@@ -414,6 +424,7 @@ export default function PostCreator({ data, onNavigate, onClose, initialRecordId
     try {
       await regenerateCaption(campaign.post_id, platform, normalizePrompt(form.captionPrompt));
       toast.success(`Regenerating ${PLATFORM_META[platform]?.label} caption…`);
+      setRegenCaptionConfirmPlatform(null);
       await refresh();
     } catch (e) {
       toast.error(e.message);
@@ -667,8 +678,8 @@ export default function PostCreator({ data, onNavigate, onClose, initialRecordId
                       </div>
                       <div className="text-[10px] lg:text-xs text-ink-500 mt-1 uppercase tracking-tight">
                         {t === 'observance' && 'AI-GENERATED VISUAL'}
-                        {t === 'event' && '1–5 IMAGE LINKS'}
-                        {t === 'collage' && '1–5 IMAGE LINKS'}
+                        {t === 'event' && '1–5 IMAGE '}
+                        {t === 'collage' && '1–5 IMAGE '}
                       </div>
                     </button>
                   );
@@ -719,6 +730,10 @@ export default function PostCreator({ data, onNavigate, onClose, initialRecordId
                 onRegenerateVariants={null}
                 busy={busy}
                 locked={isEditing && platforms.some(p => campaign?.[`${p}_published_status`] === 'posted')}
+                regenUntilMs={regenImageUntilMs}
+                nowMs={regenNowMs}
+                regenCount={campaign?.generated_image_variants?.length ?? 0}
+                regenMax={10}
               />
             )}
 
@@ -784,7 +799,7 @@ export default function PostCreator({ data, onNavigate, onClose, initialRecordId
                       draftEdit={draftEdit}
                       setDraftEdit={setDraftEdit}
                       busy={busy}
-                      onRegenerate={(p) => handleRegenerateCaption(p)}
+                      onRegenerate={(p) => setRegenCaptionConfirmPlatform(p)}
                       onSaveEdit={(text, p) => handleSaveCaption(text, p)}
                       onApprove={(p) => handleApprove(p)}
                       approvalDirty={!!approvalDirty[pid]}
@@ -890,6 +905,17 @@ export default function PostCreator({ data, onNavigate, onClose, initialRecordId
               </div>
             )}
 
+            {!isEditing && (
+              <button
+                onClick={handleForge}
+                disabled={busy === 'forge' || generating}
+                className="w-full rounded-2xl bg-brand-gradient text-white font-bold px-5 py-3.5 inline-flex items-center justify-center gap-2.5 shadow-glow hover:shadow-lift transition-all disabled:opacity-60 disabled:cursor-not-allowed disabled:shadow-none"
+              >
+                {busy === 'forge' || generating ? <Spinner /> : <SparkleIcon />}
+                <span className="text-base">{generating ? 'Running workflow…' : 'Create Content'}</span>
+              </button>
+            )}
+
             <div className="rounded-2xl bg-gradient-to-br from-blue-50 to-cream-50 border border-blue-100 p-5">
               <div className="flex items-center gap-2 text-accent-blue font-semibold">
                 <span className="h-7 w-7 rounded-lg bg-accent-blue text-white flex items-center justify-center">
@@ -918,7 +944,7 @@ export default function PostCreator({ data, onNavigate, onClose, initialRecordId
 
               {/* Post Now — ships the active platform immediately */}
               <button
-                onClick={() => handlePostNow(activePlatform)}
+                onClick={() => { window.scrollTo({ top: 0, behavior: 'smooth' }); setPublishConfirm({ action: 'post', platform: activePlatform }); }}
                 disabled={!isEditing || !caption || busy === `post-${activePlatform}` || published === 'posted'}
                 className="mt-4 w-full bg-gradient-to-r from-accent-blue to-blue-500 hover:from-blue-600 hover:to-blue-500 text-white font-bold rounded-lg px-4 py-2.5 inline-flex items-center justify-center gap-2 transition-all shadow-soft hover:shadow-lift disabled:opacity-50 disabled:cursor-not-allowed disabled:shadow-none disabled:bg-gradient-to-r disabled:from-cream-300 disabled:to-cream-300 disabled:text-ink-500"
               >
@@ -968,7 +994,7 @@ export default function PostCreator({ data, onNavigate, onClose, initialRecordId
               </div>
 
               <button
-                onClick={() => handleSchedule()}
+                onClick={() => { window.scrollTo({ top: 0, behavior: 'smooth' }); setPublishConfirm({ action: 'schedule', platform: activePlatform }); }}
                 disabled={!isEditing || !caption || busy === `schedule-${activePlatform}` || published === 'posted'}
                 className="mt-3 w-full btn-ghost border-blue-200 text-accent-blue font-bold inline-flex items-center justify-center gap-2 disabled:opacity-50 disabled:cursor-not-allowed disabled:border-cream-300 disabled:text-ink-500"
               >
@@ -1028,6 +1054,99 @@ export default function PostCreator({ data, onNavigate, onClose, initialRecordId
           onClose={() => busy !== 'image' && setRegenImageModalOpen(false)}
         />
       )}
+
+      {regenCaptionConfirmPlatform && (
+        <DeleteConfirmModal
+          title={`Regenerate ${PLATFORM_META[regenCaptionConfirmPlatform]?.label} caption?`}
+          description="A new AI-generated caption will replace the current one. The previous caption cannot be recovered."
+          confirmLabel="Regenerate"
+          busy={busy === `caption-${regenCaptionConfirmPlatform}`}
+          onConfirm={() => handleRegenerateCaption(regenCaptionConfirmPlatform)}
+          onClose={() => { if (busy !== `caption-${regenCaptionConfirmPlatform}`) setRegenCaptionConfirmPlatform(null); }}
+        />
+      )}
+
+      {publishConfirm && (() => {
+        const { action, platform } = publishConfirm;
+        const meta = PLATFORM_META[platform];
+        const isPost = action === 'post';
+        const busyKey = isPost ? `post-${platform}` : `schedule-${platform}`;
+        let schedLabel = '';
+        if (!isPost) {
+          let h = parseInt(schedHour, 10) || 0;
+          if (schedAmpm === 'PM' && h < 12) h += 12;
+          if (schedAmpm === 'AM' && h === 12) h = 0;
+          schedLabel = `${schedDate} at ${String(h).padStart(2, '0')}:00 ${schedAmpm}`;
+        }
+        const isBusy = busy === busyKey;
+        return (
+          <div
+            className="fixed inset-0 z-50 bg-ink-900/55 backdrop-blur-sm overflow-y-auto animate-fade-in"
+            onClick={() => !isBusy && setPublishConfirm(null)}
+          >
+            <div className="min-h-screen flex items-center justify-center p-4">
+            <div
+              className="bg-white rounded-2xl shadow-2xl w-full max-w-sm border border-cream-200 overflow-hidden animate-fade-up"
+              onClick={(e) => e.stopPropagation()}
+            >
+              {/* Header */}
+              <div className={`px-6 pt-6 pb-4 flex items-start gap-4`}>
+                <div className={`h-11 w-11 rounded-full flex items-center justify-center shrink-0 ${isPost ? 'bg-blue-50 text-accent-blue' : 'bg-brand-50 text-brand-700'}`}>
+                  {isPost
+                    ? <svg viewBox="0 0 24 24" className="h-5 w-5" fill="none" stroke="currentColor" strokeWidth="2"><path d="M22 2L11 13M22 2l-7 20-4-9-9-4 20-7z" strokeLinecap="round" strokeLinejoin="round"/></svg>
+                    : <svg viewBox="0 0 24 24" className="h-5 w-5" fill="none" stroke="currentColor" strokeWidth="2"><rect x="3" y="4" width="18" height="18" rx="2"/><path d="M16 2v4M8 2v4M3 10h18" strokeLinecap="round"/></svg>
+                  }
+                </div>
+                <div>
+                  <h3 className="h-display text-base text-ink-900">
+                    {isPost ? `Post to ${meta?.label}?` : `Schedule on ${meta?.label}?`}
+                  </h3>
+                  <p className="text-sm text-ink-500 mt-1">
+                    {isPost
+                      ? `This will immediately publish to ${meta?.label}. This cannot be undone.`
+                      : `Post will be scheduled for ${schedLabel}.`}
+                  </p>
+                </div>
+              </div>
+
+              {/* Platform pill */}
+              <div className="px-6 pb-4">
+                <div className="flex items-center gap-2 px-3 py-2 rounded-xl bg-cream-50 border border-cream-200">
+                  <span className="h-2 w-2 rounded-full shrink-0" style={{ background: meta?.color }} />
+                  <span className="text-xs font-semibold text-ink-700">{meta?.label}</span>
+                  <span className="text-xs text-ink-400 ml-auto">{form.eventName || 'Untitled post'}</span>
+                </div>
+              </div>
+
+              {/* Actions */}
+              <div className="px-6 pb-6 flex items-center justify-end gap-2">
+                <button
+                  type="button"
+                  onClick={() => !isBusy && setPublishConfirm(null)}
+                  disabled={isBusy}
+                  className="btn-ghost text-sm px-4 py-2 disabled:opacity-50"
+                >
+                  Cancel
+                </button>
+                <button
+                  type="button"
+                  disabled={isBusy}
+                  onClick={() => {
+                    setPublishConfirm(null);
+                    if (isPost) handlePostNow(platform);
+                    else handleSchedule(platform);
+                  }}
+                  className={`inline-flex items-center gap-2 font-bold rounded-xl px-5 py-2.5 text-sm text-white transition-all shadow-soft disabled:opacity-60 disabled:cursor-not-allowed ${isPost ? 'bg-gradient-to-r from-accent-blue to-blue-500 hover:from-blue-600 hover:to-blue-500' : 'bg-brand-gradient hover:opacity-90'}`}
+                >
+                  {isBusy && <Spinner />}
+                  {isPost ? 'Post Now' : 'Schedule Post'}
+                </button>
+              </div>
+            </div>
+            </div>
+          </div>
+        );
+      })()}
 
       {publishingState && (
         <PublishingOverlay
@@ -1101,21 +1220,21 @@ function PreviewModal({ platform, caption, images, eventName, onClose }) {
 
   return (
     <div
-      className="fixed inset-0 z-50 bg-ink-900/55 backdrop-blur-sm flex items-start justify-center p-4 sm:p-8 overflow-y-auto animate-fade-in"
+      className="fixed inset-0 z-50 bg-ink-900/55 backdrop-blur-sm flex items-start justify-center p-4 pt-8 overflow-y-auto animate-fade-in"
       onClick={onClose}
     >
       <div
-        className="bg-white rounded-2xl shadow-2xl w-full max-w-xl border border-cream-200 animate-fade-up"
+        className="bg-white rounded-2xl shadow-2xl w-full max-w-[450px] max-h-[92vh] border border-cream-200 animate-fade-up flex flex-col overflow-hidden"
         onClick={(e) => e.stopPropagation()}
       >
-        <header className="px-5 py-4 flex items-center justify-between gap-3 border-b border-cream-200 sticky top-0 bg-white rounded-t-2xl">
-          <h3 className="h-display text-lg text-ink-900">
+        <header className="px-4 py-3 flex items-center justify-between gap-3 border-b border-cream-200 shrink-0">
+          <h3 className="h-display text-base text-ink-900">
             {meta?.label || 'Preview'}
           </h3>
           <button
             type="button"
             onClick={onClose}
-            className="h-9 w-9 rounded-full bg-cream-100 hover:bg-cream-200 text-ink-700 flex items-center justify-center transition-all"
+            className="h-8 w-8 rounded-full bg-cream-100 hover:bg-cream-200 text-ink-700 flex items-center justify-center transition-all"
             aria-label="Close preview"
           >
             <svg viewBox="0 0 24 24" className="h-4 w-4" fill="none" stroke="currentColor" strokeWidth="2.5">
@@ -1123,7 +1242,7 @@ function PreviewModal({ platform, caption, images, eventName, onClose }) {
             </svg>
           </button>
         </header>
-        <div className="p-4">
+        <div className="p-3 overflow-y-auto flex-1 scrollbar-none min-h-0">
           <PreviewSwitcher
             platform={platform}
             caption={caption}
