@@ -8,7 +8,7 @@ import {
   PLATFORM_LIST, PLATFORM_META
 } from '../utils/config.js';
 // uploadToImageKit is dynamic-imported inside ImageLinksUploader to keep this file lean
-import { waitForCampaign } from '../services/supabase.js';
+import { waitForCampaign, supabase, CAMPAIGNS_TABLE } from '../services/supabase.js';
 import {
   createCampaign, regenerateImage, regenerateVariants,
   regenerateCaption, saveCaptionEdit,
@@ -17,6 +17,7 @@ import {
 } from '../services/webhook.js';
 import DeleteConfirmModal from '../components/DeleteConfirmModal.jsx';
 import RegenerateImagePromptModal from '../components/RegenerateImagePromptModal.jsx';
+import RegenerateCaptionModal from '../components/RegenerateCaptionModal.jsx';
 
 function genPostId() {
   if (typeof crypto !== 'undefined' && crypto.randomUUID) return crypto.randomUUID();
@@ -68,15 +69,18 @@ export default function PostCreator({ data, onNavigate, onClose, initialRecordId
 
   const handleSelectVariant = async (i) => {
     setVariantIdx(i); // optimistic
-    // Smooth-scroll to top so the user sees the freshly-selected variant in the right-rail
-    // preview and the platform caption cards without having to scroll back up.
     window.scrollTo({ top: 0, behavior: 'smooth' });
     if (!campaign) return;
-    try {
-      const { selectVariant } = await import('../services/webhook.js');
-      await selectVariant(campaign.post_id, i);
-    } catch (e) {
-      console.error('selectVariant', e);
+    const { data, error } = await supabase
+      .from(CAMPAIGNS_TABLE)
+      .update({ selected_variant_index: i })
+      .eq('post_id', campaign.post_id)
+      .select('post_id, selected_variant_index');
+    if (error) {
+      console.error('selectVariant error', error);
+      toast.error('Failed to save variant selection');
+    } else {
+      console.log('[selectVariant] wrote index', i, '→ DB returned', data);
     }
   };
 
@@ -123,7 +127,7 @@ export default function PostCreator({ data, onNavigate, onClose, initialRecordId
     }
     setEditingPlatform(null);
     setApprovalDirty({});
-  }, [campaign]);
+  }, [campaign?.post_id]); // eslint-disable-line react-hooks/exhaustive-deps
 
   // Clean up blob URLs created by file uploads when component unmounts
   useEffect(() => {
@@ -413,7 +417,7 @@ export default function PostCreator({ data, onNavigate, onClose, initialRecordId
     finally { setBusy(null); }
   };
 
-  const handleRegenerateCaption = async (platform = activePlatform) => {
+  const handleRegenerateCaption = async (platform = activePlatform, promptOverride) => {
     if (!campaign) return;
     setBusy(`caption-${platform}`);
     setApprovalDirty(prev => ({ ...prev, [platform]: true }));
@@ -422,7 +426,7 @@ export default function PostCreator({ data, onNavigate, onClose, initialRecordId
     setRegenCaptionUntil(prev => ({ ...prev, [platform]: Date.now() + 30000 }));
     setRegenNowMs(Date.now());
     try {
-      await regenerateCaption(campaign.post_id, platform, normalizePrompt(form.captionPrompt));
+      await regenerateCaption(campaign.post_id, platform, normalizePrompt(promptOverride ?? form.captionPrompt));
       toast.success(`Regenerating ${PLATFORM_META[platform]?.label} caption…`);
       setRegenCaptionConfirmPlatform(null);
       await refresh();
@@ -1056,12 +1060,14 @@ export default function PostCreator({ data, onNavigate, onClose, initialRecordId
       )}
 
       {regenCaptionConfirmPlatform && (
-        <DeleteConfirmModal
-          title={`Regenerate ${PLATFORM_META[regenCaptionConfirmPlatform]?.label} caption?`}
-          description="A new AI-generated caption will replace the current one. The previous caption cannot be recovered."
-          confirmLabel="Regenerate"
+        <RegenerateCaptionModal
+          platform={regenCaptionConfirmPlatform}
+          initialPrompt={form.captionPrompt}
           busy={busy === `caption-${regenCaptionConfirmPlatform}`}
-          onConfirm={() => handleRegenerateCaption(regenCaptionConfirmPlatform)}
+          onConfirm={(editedPrompt) => {
+            setForm(f => ({ ...f, captionPrompt: editedPrompt }));
+            handleRegenerateCaption(regenCaptionConfirmPlatform, editedPrompt);
+          }}
           onClose={() => { if (busy !== `caption-${regenCaptionConfirmPlatform}`) setRegenCaptionConfirmPlatform(null); }}
         />
       )}
@@ -1435,7 +1441,7 @@ function ImageLinksUploader({ images = [], onChange, max = 5, disabled = false }
     <div className="mt-5 rounded-xl bg-gradient-to-br from-cream-100 to-cream-50 border border-cream-300/60 p-5">
       <div className="flex items-start justify-between gap-3 mb-4">
         <div>
-          <div className="text-[11px] uppercase tracking-[0.18em] text-ink-500 font-bold">Image Links</div>
+          <div className="text-[11px] uppercase tracking-[0.18em] text-ink-500 font-bold">Image </div>
           <div className="text-xs text-ink-500 mt-1">Add 1 or more images (max {max})</div>
         </div>
         <button

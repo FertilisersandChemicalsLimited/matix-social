@@ -47,6 +47,7 @@ export default function Schedule({ data, onNavigate, onNewPost }) {
   const [limit, setLimit] = useState(12);
   const [activeFilter, setActiveFilter] = useState('All');
   const [platformFilter, setPlatformFilter] = useState(null);
+  const [searchQuery, setSearchQuery] = useState('');
   const [deleteTarget, setDeleteTarget] = useState(null); // campaign object pending deletion
   const [deleteBusy, setDeleteBusy] = useState(false);
   const toast = useToast();
@@ -96,18 +97,29 @@ export default function Schedule({ data, onNavigate, onNewPost }) {
 
     if (platformFilter) res = res.filter(c => campaignPlatforms(c).includes(platformFilter));
 
+    if (searchQuery.trim()) {
+      const q = searchQuery.trim().toLowerCase();
+      res = res.filter(c => (c.event_name || '').toLowerCase().includes(q));
+    }
+
     return res.sort((a, b) => {
-      const getVal = (c) => {
-        const d = primaryScheduledAt(c) || primaryPostedAt(c) || c.event_date || c.created_at;
-        return d ? new Date(d).getTime() : 0;
-      };
-      return getVal(b) - getVal(a);
+      const ts = (d) => d ? new Date(d).getTime() : 0;
+      if (activeFilter === 'Scheduled') {
+        // soonest scheduled date first (ascending)
+        return ts(primaryScheduledAt(a)) - ts(primaryScheduledAt(b));
+      }
+      if (activeFilter === 'Posted') {
+        // most recently posted first (descending)
+        return ts(primaryPostedAt(b)) - ts(primaryPostedAt(a));
+      }
+      // All / Drafts — most recently created first (descending)
+      return ts(b.created_at) - ts(a.created_at);
     });
-  }, [campaigns, activeFilter, platformFilter]);
+  }, [campaigns, activeFilter, platformFilter, searchQuery]);
 
   const visible = useMemo(() => filtered.slice(0, limit), [filtered, limit]);
 
-  useEffect(() => { setLimit(12); }, [activeFilter, platformFilter]);
+  useEffect(() => { setLimit(12); }, [activeFilter, platformFilter, searchQuery]);
 
   return (
     <>
@@ -140,8 +152,32 @@ export default function Schedule({ data, onNavigate, onNewPost }) {
           </button>
         </div>
 
+        {/* Search bar */}
+        <div className="mt-6 relative animate-fade-up">
+          <svg viewBox="0 0 24 24" className="absolute left-3.5 top-1/2 -translate-y-1/2 h-4 w-4 text-ink-500 pointer-events-none" fill="none" stroke="currentColor" strokeWidth="2">
+            <circle cx="11" cy="11" r="7"/><path d="M21 21l-4.35-4.35" strokeLinecap="round"/>
+          </svg>
+          <input
+            type="text"
+            value={searchQuery}
+            onChange={(e) => setSearchQuery(e.target.value)}
+            placeholder="Search campaigns…"
+            className="w-full pl-10 pr-10 py-2.5 rounded-xl border border-cream-300/60 bg-white text-sm text-ink-900 placeholder-ink-500 focus:outline-none focus:ring-2 focus:ring-brand-300 focus:border-brand-400 transition-all"
+          />
+          {searchQuery && (
+            <button
+              onClick={() => setSearchQuery('')}
+              className="absolute right-3 top-1/2 -translate-y-1/2 text-ink-500 hover:text-ink-900"
+            >
+              <svg viewBox="0 0 24 24" className="h-4 w-4" fill="none" stroke="currentColor" strokeWidth="2.5">
+                <path d="M6 6l12 12M6 18L18 6" strokeLinecap="round"/>
+              </svg>
+            </button>
+          )}
+        </div>
+
         {/* Status + Platform filter row */}
-        <div className="mt-8 flex flex-wrap items-center gap-3 animate-fade-up">
+        <div className="mt-4 flex flex-wrap items-center gap-3 animate-fade-up">
           {/* Status chip group — horizontal scroll on mobile so all four chips stay reachable */}
           <div className="w-full sm:w-auto overflow-x-auto scrollbar-none -mx-1 sm:mx-0">
             <div className="inline-flex p-1 bg-cream-100 rounded-full border border-cream-300/60 mx-1 sm:mx-0">
@@ -290,7 +326,7 @@ function PipelineCard({ campaign, onClick, onDelete }) {
     status === 'failed'    ? { text: 'FAILED',    cls: 'bg-red-600 text-white' } :
                              { text: 'DRAFT',     cls: 'bg-ink-900 text-white' };
 
-  const when = primaryScheduledAt(campaign) || primaryPostedAt(campaign) || campaign.event_date;
+  const when = primaryScheduledAt(campaign) || primaryPostedAt(campaign) || campaign.created_at;
 
   return (
     <article
@@ -319,7 +355,7 @@ function PipelineCard({ campaign, onClick, onDelete }) {
             type="button"
             onClick={(e) => { e.stopPropagation(); onDelete(); }}
             title="Delete this campaign"
-            className="absolute bottom-3 right-3 h-8 w-8 rounded-full bg-white/95 hover:bg-red-50 text-ink-700 hover:text-brand-700 flex items-center justify-center shadow-soft transition-all opacity-0 group-hover:opacity-100"
+            className="absolute bottom-3 right-3 h-8 w-8 rounded-full bg-brand-gradient text-white flex items-center justify-center shadow-soft hover:shadow-lift transition-all"
           >
             <svg viewBox="0 0 24 24" className="h-4 w-4" fill="none" stroke="currentColor" strokeWidth="2">
               <path d="M3 6h18M8 6V4a2 2 0 0 1 2-2h4a2 2 0 0 1 2 2v2M19 6l-1 14a2 2 0 0 1-2 2H8a2 2 0 0 1-2-2L5 6M10 11v6M14 11v6" strokeLinecap="round" strokeLinejoin="round" />

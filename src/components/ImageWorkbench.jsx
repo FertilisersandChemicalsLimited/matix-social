@@ -44,13 +44,21 @@ export default function ImageWorkbench({
         {variants.length > 0 && (
           <div className="flex gap-3 overflow-x-auto scrollbar-none -mx-1 px-1 pb-1">
             {variants.slice(0, 6).map((src, i) => (
-              <VariantTile
-                key={i}
-                src={src}
-                index={i}
-                selected={i === variantIdx}
-                onClick={() => handlePick(i)}
-              />
+              <div key={i} className="flex flex-col items-center gap-1.5 shrink-0">
+                <VariantTile
+                  src={src}
+                  index={i}
+                  selected={i === variantIdx}
+                  onClick={() => handlePick(i)}
+                />
+                <button
+                  type="button"
+                  onClick={() => setLightboxSrc(src)}
+                  className="text-[11px] font-medium text-ink-500 hover:text-brand-700 border border-cream-300 hover:border-brand-300 rounded-md px-2.5 py-0.5 transition-colors"
+                >
+                  Preview
+                </button>
+              </div>
             ))}
           </div>
         )}
@@ -66,6 +74,9 @@ export default function ImageWorkbench({
               {locked ? 'Image locked (already posted)' : 'Regenerate Variants'}
             </button>
           </div>
+        )}
+        {lightboxSrc && (
+          <Lightbox src={lightboxSrc} onClose={() => setLightboxSrc(null)} />
         )}
       </Wrapper>
     );
