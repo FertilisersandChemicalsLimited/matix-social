@@ -388,7 +388,7 @@ function TopBar({ onNewPost }) {
     <header className="hidden lg:block sticky top-0 z-20 glass border-b border-cream-300/60">
       <div className="px-4 lg:px-10 h-16 flex items-center justify-end">
         <button onClick={onNewPost} className="btn-primary inline-flex items-center gap-2 px-4 py-2 text-sm">
-          <PlusIcon /> Create
+          <PlusIcon /> New Post 
         </button>
       </div>
     </header>
