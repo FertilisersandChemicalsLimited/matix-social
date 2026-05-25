@@ -298,13 +298,13 @@ export default function PostCreator({ data, onNavigate, onClose, initialRecordId
     return () => clearInterval(i);
   }, [publishingState, refresh]);
 
-  // Safety cap — give up after 3 minutes so the overlay can't get stuck forever
+  // Auto-close after 20s and redirect to pipeline
   useEffect(() => {
     if (!publishingState) return;
     const t = setTimeout(() => {
       setPublishingState(null);
-      toast.error('Still waiting on the platform — refresh to check status');
-    }, 3 * 60 * 1000);
+      onNavigate('schedule');
+    }, 20 * 1000);
     return () => clearTimeout(t);
   }, [publishingState]); // eslint-disable-line react-hooks/exhaustive-deps
 
