@@ -1205,9 +1205,9 @@ function PublishingOverlay({ platform, action, elapsed }) {
             <strong className="text-ink-900">{elapsed}s</strong> elapsed
           </div>
 
-          <p className="text-[11px] text-ink-500 mt-5">
+          {/* <p className="text-[11px] text-ink-500 mt-5">
             This overlay closes automatically as soon as Supabase shows <code className="font-mono">{platform}_published_status = '{waitingFor}'</code>.
-          </p>
+          </p> */}
         </div>
       </div>
     </div>
