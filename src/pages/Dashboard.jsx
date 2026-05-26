@@ -107,7 +107,7 @@ export default function Dashboard({ data, onNavigate, onNewPost }) {
   const upcoming = useMemo(() => {
     return campaigns
       .filter(c => primaryPublished(c) !== 'posted')
-      .sort((a, b) => new Date(a.event_date || a.created_at || 0) - new Date(b.event_date || b.created_at || 0))
+      .sort((a, b) => new Date(b.created_at || 0) - new Date(a.created_at || 0))
       .slice(0, 5);
   }, [campaigns]);
 
