@@ -27,6 +27,27 @@ export const CAPTION_STATUSES   = ['idle', 'generating', 'ready', 'regenerate', 
 export const APPROVAL_STATUSES  = ['draft', 'approved', 'rejected'];
 export const PUBLISHED_STATUSES = ['draft', 'scheduled', 'posted', 'failed'];
 
+// Short words + colors for a single platform's publish state. The campaign-level badges
+// collapse four platforms into one value (see primaryPublished), so anywhere that needs to
+// say "which platform is this actually scheduled on" reads through these instead.
+export const PLATFORM_STATUS_LABELS = {
+  draft:     'Draft',
+  scheduled: 'Scheduled',
+  posted:    'Posted',
+  failed:    'Failed'
+};
+
+export const PLATFORM_STATUS_COLORS = {
+  draft:     '#7a6655',
+  scheduled: '#0e63a3',
+  posted:    '#1f8a4c',
+  failed:    '#9a2d1c'
+};
+
+export function platformStatus(c, p) {
+  return c?.[`${p}_published_status`] || 'draft';
+}
+
 export function campaignPlatforms(c) {
   return (c && Array.isArray(c.platforms_selected)) ? c.platforms_selected : [];
 }

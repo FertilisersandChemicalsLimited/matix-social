@@ -1,6 +1,7 @@
 import React, { useEffect, useMemo, useState } from 'react';
 import {
   PLATFORM_LIST, PLATFORM_META,
+  PLATFORM_STATUS_LABELS, PLATFORM_STATUS_COLORS, platformStatus,
   primaryPublished, primaryApproval, primaryCaption,
   primaryPostedAt, selectedImage, campaignPlatforms
 } from '../utils/config.js';
@@ -206,30 +207,49 @@ export default function Dashboard({ data, onNavigate, onNewPost }) {
                       </div>
                       <div className="min-w-0 flex-1">
                         {/* Title + platforms — stack vertically on mobile so the title doesn't
-                            compete with platform chips for horizontal space; inline on sm+ */}
-                        <div className="flex flex-col sm:flex-row sm:items-center sm:flex-wrap gap-1 sm:gap-2">
-                          <div className="font-bold text-ink-900 group-hover:text-brand-700 transition-colors truncate">
+                            compete with platform chips for horizontal space; inline on sm+.
+                            Chips never wrap: with four platforms carrying status pills the row
+                            would grow tall and collide with the badge, so it scrolls sideways
+                            instead. Both halves are min-w-0 so the title truncates and the
+                            strip scrolls rather than either one pushing the row wider. */}
+                        <div className="flex flex-col sm:flex-row sm:items-center gap-1 sm:gap-2 min-w-0">
+                          {/* min-w-0 lets it truncate; the sm floor stops four wide chips from
+                              shrinking the title away to nothing on the inline layout. */}
+                          <div className="font-bold text-ink-900 group-hover:text-brand-700 transition-colors truncate min-w-0 sm:min-w-[7rem]">
                             {c.event_name || '(untitled)'}
                           </div>
-                          <div className="flex items-center gap-1 flex-wrap">
-                            {campaignPlatforms(c).map(p => (
-                              <span key={p}
-                                className="text-[9px] font-bold uppercase tracking-wider rounded inline-flex items-center justify-center px-1.5 py-0.5"
-                                style={{ background: `${PLATFORM_META[p]?.color}18`, color: PLATFORM_META[p]?.color }}
-                                title={PLATFORM_META[p]?.label}
-                              >
-                                {/* Logo only on mobile (saves horizontal space); full label on sm+ */}
-                                <PlatformGlyph platform={p} className="h-3 w-3 sm:hidden" />
-                                <span className="hidden sm:inline">{PLATFORM_META[p]?.label}</span>
-                              </span>
-                            ))}
+                          <div className="flex items-center gap-1 overflow-x-auto scrollbar-none min-w-0 max-w-full">
+                            {campaignPlatforms(c).map(p => {
+                              const st = platformStatus(c, p);
+                              return (
+                                <span key={p}
+                                  className="shrink-0 text-[9px] font-bold uppercase tracking-wider rounded inline-flex items-center justify-center gap-1 px-1.5 py-0.5"
+                                  style={{ background: `${PLATFORM_META[p]?.color}18`, color: PLATFORM_META[p]?.color }}
+                                  title={`${PLATFORM_META[p]?.label} — ${PLATFORM_STATUS_LABELS[st] || st}`}
+                                >
+                                  {/* Logo only on mobile (saves horizontal space); full label on sm+ */}
+                                  <PlatformGlyph platform={p} className="h-3 w-3 sm:hidden" />
+                                  <span className="hidden sm:inline">{PLATFORM_META[p]?.label}</span>
+                                  {/* Per-platform state. Only rendered once it's past draft, so the
+                                      one platform that's actually queued or live stands out. */}
+                                  {st !== 'draft' && (
+                                    <span
+                                      className="rounded px-1 py-px leading-none text-[8px]"
+                                      style={{ background: '#fff', color: PLATFORM_STATUS_COLORS[st] }}
+                                    >
+                                      {PLATFORM_STATUS_LABELS[st] || st}
+                                    </span>
+                                  )}
+                                </span>
+                              );
+                            })}
                           </div>
                         </div>
                         <div className="text-xs text-ink-500 mt-0.5 truncate">
                           {primaryCaption(c)?.slice(0, 100) || c.user_image_prompt || '—'}
                         </div>
                       </div>
-                      <StatusBadge value={cap(status)} />
+                      <StatusBadge value={cap(status)} className="shrink-0" />
                       {canDelete && (
                         <button
                           type="button"

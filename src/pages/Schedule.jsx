@@ -3,7 +3,7 @@ import StatusBadge from '../components/StatusBadge.jsx';
 import { Spinner } from '../components/Loader.jsx';
 import { PlatformStack, PlatformPill } from '../components/PlatformChip.jsx';
 import {
-  PLATFORM_LIST, POST_TYPE_LABELS,
+  PLATFORM_LIST, PLATFORM_META, POST_TYPE_LABELS, platformStatus,
   primaryPublished, primaryScheduledAt, primaryPostedAt,
   primaryCaption, selectedImage, campaignPlatforms
 } from '../utils/config.js';
@@ -318,7 +318,14 @@ function PipelineCard({ campaign, onClick, onDelete }) {
   const platforms = campaignPlatforms(campaign);
 
   // Only allow deletion when nothing has shipped — published campaigns are protected.
-  const canDelete = !platforms.some(p => campaign[`${p}_published_status`] === 'posted');
+  const canDelete = !platforms.some(p => platformStatus(campaign, p) === 'posted');
+
+  // The icons mirror the status tag rather than listing every platform the campaign was
+  // created for. A card tagged SCHEDULED where only LinkedIn is queued (X still draft)
+  // shows LinkedIn alone, so the badge and the icons never disagree. Falls back to the full
+  // list if nothing matches, so a card can never end up with no icons at all.
+  const statusPlatforms = platforms.filter(p => platformStatus(campaign, p) === status);
+  const shownPlatforms = statusPlatforms.length ? statusPlatforms : platforms;
 
   const statusTag =
     status === 'posted'    ? { text: 'POSTED',    cls: 'bg-accent-green text-white' } :
@@ -341,8 +348,11 @@ function PipelineCard({ campaign, onClick, onDelete }) {
           <div className="absolute inset-0 flex items-center justify-center text-ink-400 text-xs italic">No image yet</div>
         )}
 
-        <div className="absolute top-3 left-3">
-          <PlatformStack platforms={platforms} size="sm" />
+        <div
+          className="absolute top-3 left-3"
+          title={`${statusTag.text.toLowerCase()} on ${shownPlatforms.map(p => PLATFORM_META[p]?.label).join(', ')}`}
+        >
+          <PlatformStack platforms={shownPlatforms} size="sm" />
         </div>
 
         <span className={`absolute top-3 right-3 text-[10px] font-bold tracking-wider rounded-md px-2 py-1 shadow-soft ${statusTag.cls}`}>

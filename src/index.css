@@ -182,6 +182,15 @@ body::before {
   }
 }
 
+/* ---------- Utility: hide scrollbar on horizontal strips ----------
+   Used by the platform chip strips and filter rows. Tailwind has no built-in
+   for this and the project runs no plugins, so it's defined here. */
+.scrollbar-none {
+  scrollbar-width: none;          /* Firefox */
+  -ms-overflow-style: none;       /* legacy Edge */
+}
+.scrollbar-none::-webkit-scrollbar { display: none; }
+
 /* ---------- Utility: line clamp tweak ---------- */
 .line-clamp-2 {
   display: -webkit-box;

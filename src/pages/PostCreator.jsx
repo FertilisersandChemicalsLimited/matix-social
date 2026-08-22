@@ -5,7 +5,8 @@ import ImageWorkbench from '../components/ImageWorkbench.jsx';
 import { useToast } from '../components/Toast.jsx';
 import {
   POST_TYPES, POST_TYPE_LABELS, CAPTION_STYLES,
-  PLATFORM_LIST, PLATFORM_META
+  PLATFORM_LIST, PLATFORM_META,
+  PLATFORM_STATUS_LABELS, PLATFORM_STATUS_COLORS, platformStatus
 } from '../utils/config.js';
 // uploadToImageKit is dynamic-imported inside ImageLinksUploader to keep this file lean
 import { waitForCampaign, supabase, CAMPAIGNS_TABLE } from '../services/supabase.js';
@@ -147,6 +148,9 @@ export default function PostCreator({ data, onNavigate, onClose, initialRecordId
   const published = campaign ? campaign[`${activePlatform}_published_status`] : 'draft';
   const scheduledAt = campaign ? campaign[`${activePlatform}_scheduled_at`] : null;
   const postedAt    = campaign ? campaign[`${activePlatform}_posted_at`] : null;
+  // This platform is queued but not yet shipped. The Schedule controls lock (re-scheduling
+  // happens by cancelling in n8n, not here) while Post Now stays live as an override.
+  const isScheduled = published === 'scheduled';
 
   const images = useMemo(() => {
     // Live preview for new posts being composed
@@ -870,11 +874,13 @@ export default function PostCreator({ data, onNavigate, onClose, initialRecordId
                   {platforms.map(pid => {
                     const m = PLATFORM_META[pid];
                     const active = activePlatform === pid;
+                    const st = campaign ? platformStatus(campaign, pid) : 'draft';
                     return (
                       <button
                         key={pid}
                         onClick={() => setActivePlatform(pid)}
                         style={active ? { background: m.color, color: '#fff', borderColor: m.color } : { color: m.color }}
+                        title={`${m.label} — ${PLATFORM_STATUS_LABELS[st] || 'Draft'}`}
                         className={[
                           'inline-flex items-center gap-1 rounded-full border px-2.5 py-1 text-[11px] font-semibold transition-all',
                           active ? 'shadow-soft' : 'bg-white border-cream-300/60 hover:border-current'
@@ -882,6 +888,13 @@ export default function PostCreator({ data, onNavigate, onClose, initialRecordId
                       >
                         <PlatformGlyph platform={pid} className="h-3 w-3" />
                         {m.label}
+                        {/* These chips also pick the publish target, so the state belongs here too. */}
+                        {st !== 'draft' && (
+                          <span
+                            className="ml-0.5 h-1.5 w-1.5 rounded-full"
+                            style={{ background: active ? '#fff' : PLATFORM_STATUS_COLORS[st] }}
+                          />
+                        )}
                       </button>
                     );
                   })}
@@ -934,8 +947,19 @@ export default function PostCreator({ data, onNavigate, onClose, initialRecordId
                   ? 'Run Generate Content first, then publish or schedule from here.'
                   : published === 'posted'
                     ? `${activeMeta?.label || 'This platform'} has already been published — Post Now and Schedule are locked.`
-                    : `Publish now or pick a date + time to schedule on ${activeMeta?.label || 'the active platform'}.`}
+                    : isScheduled
+                      ? `${activeMeta?.label || 'This platform'} is already scheduled. Post Now publishes immediately instead of waiting for the queued time.`
+                      : `Publish now or pick a date + time to schedule on ${activeMeta?.label || 'the active platform'}.`}
               </p>
+
+              {isScheduled && scheduledAt && (
+                <div className="mt-3 rounded-lg bg-blue-50 border border-blue-100 px-3 py-2 text-[11px] text-accent-blue flex items-center gap-2">
+                  <svg viewBox="0 0 24 24" className="h-3.5 w-3.5 shrink-0" fill="none" stroke="currentColor" strokeWidth="2.5">
+                    <circle cx="12" cy="12" r="9" /><path d="M12 7v5l3 2" strokeLinecap="round" strokeLinejoin="round" />
+                  </svg>
+                  <span>Scheduled for <strong>{new Date(scheduledAt).toLocaleString()}</strong></span>
+                </div>
+              )}
 
               {published === 'posted' && postedAt && (
                 <div className="mt-3 rounded-lg bg-green-50 border border-green-100 px-3 py-2 text-[11px] text-accent-green flex items-center gap-2">
@@ -961,7 +985,7 @@ export default function PostCreator({ data, onNavigate, onClose, initialRecordId
                   type="date"
                   value={schedDate}
                   onChange={(e) => setSchedDate(e.target.value)}
-                  disabled={!isEditing || published === 'posted'}
+                  disabled={!isEditing || published === 'posted' || isScheduled}
                   className="input flex-1 min-w-[140px]"
                 />
                 <div className="flex items-center gap-2">
@@ -969,7 +993,7 @@ export default function PostCreator({ data, onNavigate, onClose, initialRecordId
                     <select
                       value={schedHour}
                       onChange={(e) => setSchedHour(e.target.value)}
-                      disabled={!isEditing || published === 'posted'}
+                      disabled={!isEditing || published === 'posted' || isScheduled}
                       className="input appearance-none w-20 pr-8 text-center tabular-nums font-semibold cursor-pointer"
                     >
                       {[1,2,3,4,5,6,7,8,9,10,11,12].map(h => (
@@ -984,7 +1008,7 @@ export default function PostCreator({ data, onNavigate, onClose, initialRecordId
                     <select
                       value={schedAmpm}
                       onChange={(e) => setSchedAmpm(e.target.value)}
-                      disabled={!isEditing || published === 'posted'}
+                      disabled={!isEditing || published === 'posted' || isScheduled}
                       className="input appearance-none w-20 pr-8 text-center font-bold cursor-pointer"
                     >
                       <option value="AM">AM</option>
@@ -999,11 +1023,18 @@ export default function PostCreator({ data, onNavigate, onClose, initialRecordId
 
               <button
                 onClick={() => { window.scrollTo({ top: 0, behavior: 'smooth' }); setPublishConfirm({ action: 'schedule', platform: activePlatform }); }}
-                disabled={!isEditing || !caption || busy === `schedule-${activePlatform}` || published === 'posted'}
+                disabled={!isEditing || !caption || busy === `schedule-${activePlatform}` || published === 'posted' || isScheduled}
+                title={isScheduled ? `Already scheduled on ${activeMeta?.label || 'this platform'} — use Post Now to publish immediately.` : undefined}
                 className="mt-3 w-full btn-ghost border-blue-200 text-accent-blue font-bold inline-flex items-center justify-center gap-2 disabled:opacity-50 disabled:cursor-not-allowed disabled:border-cream-300 disabled:text-ink-500"
               >
-                {busy === `schedule-${activePlatform}` ? <Spinner /> : <ClockIcon />}
-                {published === 'posted' ? 'Already Posted' : `Schedule on ${activeMeta?.label || 'platform'}`}
+                {busy === `schedule-${activePlatform}`
+                  ? <Spinner />
+                  : (published === 'posted' || isScheduled) ? <LockIcon /> : <ClockIcon />}
+                {published === 'posted'
+                  ? 'Already Posted'
+                  : isScheduled
+                    ? 'Already Scheduled'
+                    : `Schedule on ${activeMeta?.label || 'platform'}`}
               </button>
             </div>
           </aside>
@@ -1077,6 +1108,10 @@ export default function PostCreator({ data, onNavigate, onClose, initialRecordId
         const meta = PLATFORM_META[platform];
         const isPost = action === 'post';
         const busyKey = isPost ? `post-${platform}` : `schedule-${platform}`;
+        // Read the status off the dialog's own platform rather than activePlatform, so the
+        // override warning stays correct even if the active tab changes behind the modal.
+        const wasScheduled = platformStatus(campaign, platform) === 'scheduled';
+        const queuedAt = campaign?.[`${platform}_scheduled_at`];
         let schedLabel = '';
         if (!isPost) {
           let h = parseInt(schedHour, 10) || 0;
@@ -1109,7 +1144,9 @@ export default function PostCreator({ data, onNavigate, onClose, initialRecordId
                   </h3>
                   <p className="text-sm text-ink-500 mt-1">
                     {isPost
-                      ? `This will immediately publish to ${meta?.label}. This cannot be undone.`
+                      ? (wasScheduled
+                          ? `This post is scheduled for ${queuedAt ? new Date(queuedAt).toLocaleString() : 'a later time'}. Publishing now replaces that scheduled slot. This cannot be undone.`
+                          : `This will immediately publish to ${meta?.label}. This cannot be undone.`)
                       : `Post will be scheduled for ${schedLabel}.`}
                   </p>
                 </div>
@@ -1583,28 +1620,32 @@ function ImageLinksUploader({ images = [], onChange, max = 5, disabled = false }
   );
 }
 
+// min-w-0 on the strip lets it scroll inside the flex header instead of pushing the
+// delete/close buttons off-screen once four platforms carry status labels.
 function PlatformChipStrip({ platforms, campaign }) {
   return (
-    <div className="flex items-center gap-1.5 overflow-x-auto scrollbar-none">
+    <div className="flex items-center gap-1.5 overflow-x-auto scrollbar-none min-w-0">
       {platforms.map(pid => {
         const meta = PLATFORM_META[pid];
-        const status = campaign ? campaign[`${pid}_published_status`] : null;
+        const status = campaign ? platformStatus(campaign, pid) : null;
+        const scheduledAt = campaign?.[`${pid}_scheduled_at`];
         return (
           <span
             key={pid}
             style={{ background: meta.color, color: '#fff', borderColor: meta.color }}
-            className="rounded-full px-3.5 py-2 text-sm font-semibold inline-flex items-center gap-2 border shrink-0 shadow-soft"
+            className="rounded-full pl-3.5 pr-2.5 py-2 text-sm font-semibold inline-flex items-center gap-2 border shrink-0 shadow-soft"
+            title={status === 'scheduled' && scheduledAt
+              ? `${meta.label} — scheduled for ${new Date(scheduledAt).toLocaleString()}`
+              : `${meta.label} — ${PLATFORM_STATUS_LABELS[status] || 'Draft'}`}
           >
             <PlatformGlyph platform={pid} className="h-4 w-4" />
             {meta.label}
+            {/* Spell the state out rather than showing a bare dot — this strip is sticky, so
+                it's the one place the publish state is readable without scrolling. */}
             {status && status !== 'draft' && (
-              <span className={[
-                'h-1.5 w-1.5 rounded-full',
-                status === 'posted' ? 'bg-white'
-                  : status === 'scheduled' ? 'bg-white/80'
-                  : status === 'failed' ? 'bg-red-300'
-                  : 'bg-white/60'
-              ].join(' ')} />
+              <span className="rounded-full bg-white/25 px-2 py-0.5 text-[9px] font-bold uppercase tracking-wider leading-none">
+                {PLATFORM_STATUS_LABELS[status] || status}
+              </span>
             )}
           </span>
         );
@@ -1834,6 +1875,12 @@ const SendIcon = () => (
 const ClockIcon = () => (
   <svg viewBox="0 0 24 24" className="h-4 w-4" fill="none" stroke="currentColor" strokeWidth="2">
     <circle cx="12" cy="12" r="9" /><path d="M12 7v5l3 2" strokeLinecap="round" />
+  </svg>
+);
+const LockIcon = () => (
+  <svg viewBox="0 0 24 24" className="h-4 w-4" fill="none" stroke="currentColor" strokeWidth="2">
+    <rect x="5" y="11" width="14" height="10" rx="2" />
+    <path d="M8 11V8a4 4 0 0 1 8 0v3" strokeLinecap="round" />
   </svg>
 );
 const RefreshIcon = () => (
